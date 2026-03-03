@@ -469,7 +469,7 @@ def main(input_path, output_path, cal_csv_path):
     df_new = (pd.DataFrame(all_records)
                 .sample(frac=1, random_state=42)
                 .reset_index(drop=True))
-    df_new.to_csv(output_path, index=False)
+    df_new.to_csv(output_path, index=False, encoding='utf-8-sig')
 
     print(f"\nSaved {len(df_new)} rows → {output_path}")
     print(f"Skipped: {errors}")
@@ -488,4 +488,5 @@ if __name__ == '__main__':
         output_path='medcalc_train_claim_full.csv',
         cal_csv_path='medcalc_cal_np.csv',
     )
+
 
