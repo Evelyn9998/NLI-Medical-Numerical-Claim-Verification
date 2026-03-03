@@ -376,7 +376,7 @@ def build_explanation(true_entities, claim_entities, claim_str,
         calc_name, output_type, calc_id, calc_correct
     ))
 
-    lines.append(f'- Ground Truth Explanation: {gt_explanation}.')
+    lines.append(f'- Ground Truth Explanation: {gt_explanation}')
 
     return '\n'.join(lines)
 
@@ -488,3 +488,4 @@ if __name__ == '__main__':
         output_path='medcalc_train_claim_full.csv',
         cal_csv_path='medcalc_cal_np.csv',
     )
+
