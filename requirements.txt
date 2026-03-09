@@ -1,0 +1,18 @@
+# Core training
+torch>=2.6.0
+torchvision>=0.21.0,<0.22.0  # must match torch 2.6.x
+transformers>=4.45.0
+trl>=0.15.0                  # FSDPModule requires torch>=2.6.0
+peft>=0.13.0
+accelerate>=0.34.0
+
+# Memory optimization
+bitsandbytes>=0.43.0
+
+# Data processing
+datasets>=3.0.0
+pandas>=2.0.0
+
+# Logging & utilities
+wandb
+scikit-learn
