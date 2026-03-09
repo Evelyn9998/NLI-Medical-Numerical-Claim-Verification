@@ -1,3 +1,4 @@
 medcalc_train_claim_full.csv filter=lfs diff=lfs merge=lfs -text
+data/*.jsonl filter=lfs diff=lfs merge=lfs -text
 data/sft_train.jsonl filter=lfs diff=lfs merge=lfs -text
 data/grpo_train.jsonl filter=lfs diff=lfs merge=lfs -text
