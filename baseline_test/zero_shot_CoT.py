@@ -23,6 +23,7 @@ import os
 import random
 import re
 import sys
+import time
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -31,9 +32,10 @@ from datetime import datetime
 
 SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a claim, determine if the claim is TRUE, FALSE, or PARTIALLY TRUE based solely on the provided evidence.
 
-Think step by step, then respond in this exact JSON format (no other text, no markdown fences):
+Let's think step by step. First write out your reasoning, then conclude with the label.
+Respond in this exact JSON format (no other text, no markdown fences):
 {
-  "reasoning": "<your step-by-step chain of thought>",
+  "reasoning": "<your step-by-step reasoning leading to the conclusion>",
   "label": "<true|false|partially true>"
 }
 
@@ -266,6 +268,14 @@ def main():
         help="Max output tokens per inference (default: 512)"
     )
     parser.add_argument(
+        "--start", type=int, default=1,
+        help="1-based index to start from (default: 1)"
+    )
+    parser.add_argument(
+        "--delay", type=float, default=2.0,
+        help="Seconds to sleep between API calls (default: 2.0)"
+    )
+    parser.add_argument(
         "--output", default="",
         help="Output CSV path (default: auto-generated with timestamp)"
     )
@@ -279,35 +289,54 @@ def main():
         subset = random.sample(all_data, n)
         print(f"Randomly selected {n} samples")
     else:
-        subset = all_data[:n]
-        print(f"Using first {n} samples")
+        start_idx = args.start - 1
+        subset = all_data[start_idx:start_idx + n] if args.samples != 0 else all_data[start_idx:]
+        print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
     # Load model (Groq API client)
     model = load_model(args.groq_model)
 
+    # Prepare output file (write header immediately)
+    out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    fieldnames = ["index", "evidence", "claim", "true_label", "predicted_label",
+                  "match", "model_reasoning", "dataset_explanation"]
+    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+    print(f"Writing results live to: {out_path}\n")
+
     # Evaluation loop
     results = []
+    n = len(subset)
     print(f"Starting evaluation ({n} samples)...\n")
 
-    for i, item in enumerate(subset, start=1):
-        print(f"[{i}/{n}] Running inference...")
-        try:
-            resp = call_model(
-                model=model,
-                evidence=item["evidence"],
-                claim=item["claim"],
-                ev_limit=args.ev_limit,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-            )
-            predicted = normalize_label(resp["label"])
-            reasoning = resp["reasoning"]
-        except Exception as e:
-            predicted = "unknown"
-            reasoning = f"Error: {e}"
+    for i, item in enumerate(subset, start=args.start):
+        print(f"[{i}/{args.start + n - 1}] Running inference...")
+        predicted = "unknown"
+        reasoning = ""
+        for attempt in range(3):
+            try:
+                resp = call_model(
+                    model=model,
+                    evidence=item["evidence"],
+                    claim=item["claim"],
+                    ev_limit=args.ev_limit,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                )
+                predicted = normalize_label(resp["label"])
+                reasoning = resp["reasoning"]
+                break
+            except Exception as e:
+                print(f"  [attempt {attempt+1}/3] Error: {e}")
+                if attempt < 2:
+                    wait = 30 * (attempt + 1)
+                    print(f"  Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    reasoning = f"Error: {e}"
 
         match = predicted == item["label"]
-        results.append({
+        row = {
             "index":       i,
             "evidence":    item["evidence"],
             "claim":       item["claim"],
@@ -316,15 +345,30 @@ def main():
             "match":       match,
             "reasoning":   reasoning,
             "explanation": item["explanation"],
-        })
+        }
+        results.append(row)
+
+        # Append this row to CSV immediately
+        with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writerow({
+                "index":               row["index"],
+                "evidence":            row["evidence"],
+                "claim":               row["claim"],
+                "true_label":          row["true_label"],
+                "predicted_label":     row["predicted"],
+                "match":               "TRUE" if row["match"] else "FALSE",
+                "model_reasoning":     row["reasoning"].replace("\n", " "),
+                "dataset_explanation": row["explanation"].replace("\n", " "),
+            })
+
         print(f"  true={item['label']}  predicted={predicted}  match={match}")
+        if i < args.start + n - 1:
+            time.sleep(args.delay)
 
     # Summary
     print_summary(results)
-
-    # Save CSV
-    out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    save_results(results, out_path)
+    print(f"Results saved to: {out_path}")
 
 
 if __name__ == "__main__":
