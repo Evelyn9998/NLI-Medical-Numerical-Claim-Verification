@@ -30,7 +30,7 @@ def load_output_name_map(cal_csv_path):
 
 # Rule-based Calculator IDs
 
-RULE_BASED_CALC_IDS = {4, 8, 15, 16, 17, 18, 20, 21, 25, 27, 29, 32, 33, 43, 45, 48, 51, 68, 69}
+RULE_BASED_CALC_IDS = {4, 8, 15, 16, 17, 18, 20, 21, 25, 27, 28, 29, 32, 33, 36, 43, 45, 48, 51}
 
 
 # Output unit of each calculator
