@@ -28,6 +28,11 @@ def load_output_name_map(cal_csv_path):
     return dict(zip(df['Calculator ID'].astype(int), df['Output Name']))
 
 
+# Rule-based Calculator IDs
+
+RULE_BASED_CALC_IDS = {4, 8, 15, 16, 17, 18, 20, 21, 25, 27, 29, 32, 33, 43, 45, 48, 51, 68, 69}
+
+
 # Output unit of each calculator
 
 CALC_UNITS = {
@@ -312,7 +317,7 @@ def build_calculation_explanation(claim_answer_str, gt_answer, gt_explanation,
                                   calc_name, output_type, calc_id, is_calc_correct):
     gt_fmt = format_answer_with_unit(gt_answer, output_type, calc_id)
    
-    if output_type == 'date':
+    if output_type == 'date' or calc_id in RULE_BASED_CALC_IDS:
         if is_calc_correct:
             return (f'The calculation result in the claim is {claim_answer_str}. '
                     f'According to the {calc_name} formula, the claim\'s answer matches the correct result of {gt_fmt}, '
@@ -371,7 +376,7 @@ def build_explanation(true_entities, claim_entities, claim_str,
     claim_answer_str = m.group(1).strip() if m else '(unknown)'
 
     calc_correct = is_true
-    lines.append('- Conclusion: ' +build_calculation_explanation(
+    lines.append('- Conclusion: ' + build_calculation_explanation(
         claim_answer_str, gt_answer, gt_explanation,
         calc_name, output_type, calc_id, calc_correct
     ))
@@ -390,15 +395,15 @@ def process_row(row, output_name_map):
     except Exception:
         return []
 
-    calc_id     = row['Calculator ID']
-    calc_name   = row['Calculator Name']         
-    output_name = output_name_map.get(int(calc_id), calc_name) 
-    output_type = row['Output Type']
-    gt_answer   = row['Ground Truth Answer']
+    calc_id        = row['Calculator ID']
+    calc_name      = row['Calculator Name']         
+    output_name    = output_name_map.get(int(calc_id), calc_name) 
+    output_type    = row['Output Type']
+    gt_answer      = row['Ground Truth Answer']
     gt_explanation = row['Ground Truth Explanation']
-    lower       = row['Lower Limit']
-    upper       = row['Upper Limit']
-    note        = row['Patient Note']
+    lower          = row['Lower Limit']
+    upper          = row['Upper Limit']
+    note           = row['Patient Note']
 
     true_ans  = format_answer_with_unit(gt_answer, output_type, calc_id)
     wrong_ans = perturb_answer_with_unit(gt_answer, lower, upper, output_type, calc_id)
@@ -443,7 +448,7 @@ def process_row(row, output_name_map):
     }
 
     return [
-        {**base, 'Claim': claim_true,    'Label': 'true',          'Explanation': expl_true},
+        {**base, 'Claim': claim_true,    'Label': 'true',           'Explanation': expl_true},
         {**base, 'Claim': claim_partial, 'Label': 'partially true', 'Explanation': expl_partial},
         {**base, 'Claim': claim_false,   'Label': 'false',          'Explanation': expl_false},
     ]
