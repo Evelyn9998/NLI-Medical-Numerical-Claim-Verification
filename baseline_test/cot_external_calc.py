@@ -6,10 +6,10 @@ Step 2 (External Calculator): Pre-written Python function computes exact result 
 Step 3 (Verdict): LLM compares computed result vs claim → TRUE / FALSE / PARTIALLY TRUE.
 
 Usage:
-    export GROQ_API_KEY="gsk_..."
-    python baseline_test/cot_external_calc.py --data data/train_165.csv
-    python baseline_test/cot_external_calc.py --data data/train_165.csv --samples 20
-    python baseline_test/cot_external_calc.py --data data/train_165.csv --samples 0 --random
+    python baseline_test/cot_external_calc.py --data data/train_300.csv
+    python baseline_test/cot_external_calc.py --data data/train_300.csv --samples 20
+    python baseline_test/cot_external_calc.py --data data/train_300.csv --samples 0 --random
+    python baseline_test/cot_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct
 """
 
 import argparse
@@ -99,7 +99,12 @@ Instructions:
 2. Be careful about unit conversions (e.g. lbs→kg, inches→cm, °F→°C).
 3. For yes/no (binary) parameters, output 1 for yes/present and 0 for no/absent.
 4. For GCS sub-scores, use the exact response description (e.g. "eye opening to verbal command").
-5. After your reasoning, output a JSON block between <extraction> tags with this structure:
+5. For scoring systems (e.g. Child-Pugh, HEART, GBS, PSI, Wells), extract the RAW clinical input values — do NOT compute or output the final score yourself.
+6. Sex/gender: infer from pronouns (he/his → male, she/her → female) or words like "man", "woman".
+7. Weight/height: convert units if needed (lbs÷2.205=kg; feet/inches→cm: ft×30.48+in×2.54).
+8. Binary comorbidities: if not mentioned or explicitly absent, output 0. If present or history of, output 1.
+
+9. After your reasoning, output a JSON block between <extraction> tags with this structure:
 
 <extraction>
 {{
@@ -119,20 +124,44 @@ STEP3_SYSTEM = """You are a medical fact-checking assistant.
 
 You are given:
 - A clinical evidence note
-- A claim about a medical calculation
+- A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, <entity_2> is <value_2>, ..., <entity_N> is <value_N>.")
 - The calculator name used
 - The EXACT computed value produced by a verified Python calculator function
+- The relevant entities extracted from the evidence (the ground-truth parameter values)
 
-Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE based solely on whether the claim's stated values and conclusions match the computed result.
+Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE by following these steps carefully.
 
-Label definitions:
-- "true": the claim's numerical value and any interpretation are fully correct
-- "false": the claim contradicts the computed result (wrong value, wrong parameters, or wrong interpretation)
-- "partially true": the numerical value is close or one part is correct but another is wrong (e.g. correct score but wrong interpretation, or minor rounding difference in a borderline case)
+---
 
-Respond ONLY with this JSON (no markdown fences):
+STEP-BY-STEP VERIFICATION PROCEDURE:
+
+Step 1 — Entity verification (all entities EXCEPT the last one):
+  The claim lists entities in the form "<name> is <value>". Check each entity except the LAST one:
+  - Compare the claim's value against the evidence note.
+  - If an entity is NOT mentioned in the evidence, and the claim states it is "none" or "no", treat that entity as CORRECT.
+  - If an entity is NOT mentioned in the evidence, and the claim states a non-zero or non-none value, treat that entity as INCORRECT.
+  - Count how many input entities are correct and how many are incorrect.
+
+Step 2 — Calculation verification (the last entity in the claim):
+  The last entity in the claim is the computed result. Compare it against the EXACT computed value using these rules:
+  - Rule-based calculators (scores, classifications): the claim value must EXACTLY match the computed value.
+  - Equation-based calculators (lab tests, physical measurements, dosage conversions): the claim value must be within 5% of the computed value.
+  - Date-based calculators: the claim date must EXACTLY match the computed date.
+
+Step 3 — Assign label (read ALL three definitions carefully before choosing):
+  - "true":           ALL input entities (Step 1) are correct AND the computed result (Step 2) is correct.
+  - "partially true": ALL input entities (Step 1) are correct AND the computed result (Step 2) is WRONG.
+                      Use this when the inputs match evidence perfectly but the final answer is off.
+  - "false":          ONE OR MORE input entities (Step 1) are incorrect AND the computed result (Step 2) is also WRONG.
+                      Use this ONLY when there is an input entity error — do NOT use "false" just because the result is wrong.
+
+CRITICAL RULE: The label "false" requires an input entity error. If all inputs are correct, you MUST choose "true" or "partially true", never "false".
+
+---
+
+Show your work for each step, then output ONLY this JSON (no markdown fences):
 {
-  "reasoning": "<brief explanation>",
+  "reasoning": "<step-by-step verification: entity check, formula used, calculation process, comparison with claim>",
   "label": "<true|false|partially true>"
 }"""
 
@@ -174,28 +203,59 @@ def load_dataset(csv_path: str) -> list:
     return rows
 
 
-def load_model(groq_model: str):
-    try:
-        from groq import Groq
-    except ImportError:
-        print("groq is not installed. Run:  pip install groq")
-        sys.exit(1)
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("Error: GROQ_API_KEY not set.")
-        sys.exit(1)
-    print(f"Using Groq API  |  model: {groq_model}")
-    return Groq(api_key=api_key), groq_model
+def load_model(model_name: str):
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+    print(f"Loading model: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    has_gpu = torch.cuda.is_available()
+    print(f"  GPU available: {has_gpu}")
+
+    if has_gpu:
+        try:
+            from transformers import BitsAndBytesConfig
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+            print("  4-bit quantization enabled (bitsandbytes)")
+        except Exception as e:
+            print(f"  bitsandbytes not available ({e}), loading in fp16")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+    else:
+        print("  No GPU, loading on CPU (fp32)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+        )
+
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    print(f"Model ready: {model_name}")
+    return pipe, model_name
 
 
-def _chat(client, model, messages, temperature, max_tokens):
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
+def _chat(pipe, _model_name, messages, temperature, max_tokens):
+    do_sample = temperature > 0.0
+    result = pipe(
+        messages,
+        max_new_tokens=max_tokens,
+        temperature=temperature if do_sample else None,
+        do_sample=do_sample,
+        return_full_text=False,
     )
-    return response.choices[0].message.content.strip()
+    return result[0]["generated_text"].strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,7 +332,7 @@ def step3_verdict(client, model, item: dict,
         f"Claim:\n{item['claim']}\n\n"
         f"Calculator used: {item['calculator_name']}\n"
         f"Computed result (exact, from verified Python function): {computed_str}\n\n"
-        "Based on the computed result, is the claim TRUE, FALSE, or PARTIALLY TRUE?"
+        "Verify the claim step by step and output the JSON label."
     )
 
     raw = _chat(client, model,
@@ -288,6 +348,7 @@ def step3_verdict(client, model, item: dict,
             "label":     normalize_label(parsed.get("label", "")),
         }
     except json.JSONDecodeError:
+        # Try extracting label field
         lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
         rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
         label = normalize_label(lm.group(1)) if lm else _fallback_label(clean)
@@ -299,9 +360,26 @@ def step3_verdict(client, model, item: dict,
 
 def _fallback_label(text: str) -> str:
     t = text.lower()
-    if "partially true" in t or "partially_true" in t: return "partially true"
-    if "false" in t:  return "false"
-    if "true"  in t:  return "true"
+    # Must check "partially true" before "true" to avoid false positive
+    if "partially true" in t or "partially_true" in t:
+        return "partially true"
+    # Look for label assignment patterns before generic word search
+    if re.search(r'label["\s:]+false', t) or re.search(r'assign.*\bfalse\b', t):
+        return "false"
+    if re.search(r'label["\s:]+true', t) or re.search(r'assign.*\btrue\b', t):
+        return "true"
+    # Last resort: find the last occurrence of a label word (model tends to state label at the end)
+    last_false = t.rfind('"false"')
+    last_true  = t.rfind('"true"')
+    if last_false > last_true:
+        return "false"
+    if last_true > last_false:
+        return "true"
+    # Plain word search
+    if "false" in t:
+        return "false"
+    if "true" in t:
+        return "true"
     return "unknown"
 
 
@@ -372,8 +450,8 @@ def main():
     )
     parser.add_argument("--data",       required=True,
                         help="Path to CSV dataset")
-    parser.add_argument("--groq-model", default="llama-3.3-70b-versatile",
-                        help="Groq model (default: llama-3.3-70b-versatile)")
+    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
+                        help="HuggingFace model name or local path (default: meta-llama/Llama-3.1-8B-Instruct)")
     parser.add_argument("--samples",    type=int, default=10,
                         help="Number of samples (0 = all)")
     parser.add_argument("--random",     action="store_true",
@@ -407,7 +485,7 @@ def main():
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
     # ── Load model ────────────────────────────────────────────────────────
-    client, model = load_model(args.groq_model)
+    client, model = load_model(args.model)
 
     # ── Prepare output CSV ────────────────────────────────────────────────
     out_path = args.output or (

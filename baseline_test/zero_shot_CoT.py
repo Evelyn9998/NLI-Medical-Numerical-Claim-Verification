@@ -11,9 +11,9 @@ Install dependencies:
 
 Usage:
     export GROQ_API_KEY="your_groq_api_key_here"
-    python evaluate.py --data "train_200.csv"
-    python evaluate.py --data "train_200.csv" --samples 20 --random
-    python evaluate.py --data "train_200.csv" --samples 0
+    python evaluate.py --data "train_300.csv"
+    python evaluate.py --data "train_300.csv" --samples 20 --random
+    python evaluate.py --data "train_300.csv" --samples 0
 """
 
 import argparse
@@ -30,19 +30,49 @@ from datetime import datetime
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a claim, determine if the claim is TRUE, FALSE, or PARTIALLY TRUE based solely on the provided evidence.
+SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a clinical claim that involves numerical entities and a medical calculation, determine whether the claim is TRUE, PARTIALLY TRUE, or FALSE.
 
-Let's think step by step. First write out your reasoning, then conclude with the label.
+The claim contains a list of entities (input values extracted from the patient record) followed by a final computed result (the last entity). Work through the following steps carefully.
+
+---
+
+STEP 1 — Check each input entity (all entities EXCEPT the last one):
+For every input entity mentioned in the claim:
+a) Look for that entity in the evidence.
+   - If the entity is NOT present in the evidence AND the claim states its value as "none" or "no", treat it as CORRECT.
+   - If the entity is NOT present in the evidence AND the claim states a specific numeric value, treat it as INCORRECT → the overall label is FALSE.
+b) If the entity IS present in the evidence, compare the claim value with the evidence value and note whether they match.
+
+STEP 2 — Perform the medical calculation step by step:
+a) State the formula used.
+b) Substitute each input value from the evidence (not from the claim) into the formula.
+c) Show every arithmetic step and arrive at the correct computed result.
+d) Compare the correct computed result with the value stated in the claim's last entity.
+
+STEP 3 — Assign the label using these definitions:
+
+- "true": ALL input entities (all except the last) are correct AND the final calculation result is correct.
+  Correctness criteria for the calculation result:
+  • Rule-based calculators (e.g., scoring systems with discrete categories): the claimed answer must exactly match the ground-truth answer.
+  • Equation-based calculators (lab tests, physical measurements, dosage conversions): the claimed answer must be within 5% of the correct computed answer.
+  • Date-based equations: the claimed date must exactly match the correct date.
+
+- "partially true": ALL input entities (all except the last) are correct, BUT the final calculation result in the claim is incorrect (i.e., it deviates from the correct value). Note: the last entity (the computed result) is NOT used to judge whether entities are correct — only the preceding input entities are checked for "partially true".
+
+- "false": One or more input entities (all except the last) are incorrect AND the final calculation result is also incorrect.
+
+---
+
+IMPORTANT RULES:
+- An entity not found in the evidence is treated as INCORRECT unless the claim explicitly states its value as "none" or "no".
+- Always use the evidence values (not the claim's input values) when performing your calculation in Step 2.
+- Show the full formula and every arithmetic step before assigning the label.
+
 Respond in this exact JSON format (no other text, no markdown fences):
 {
-  "reasoning": "<your step-by-step reasoning leading to the conclusion>",
-  "label": "<true|false|partially true>"
-}
-
-Label definitions:
-- "true": the claim is fully and accurately supported by the evidence
-- "false": the claim contradicts the evidence or lacks any support
-- "partially true": the claim is partly correct but contains inaccuracies or important omissions"""
+  "reasoning": "<Step 1: entity-by-entity check | Step 2: formula, full calculation, result vs. claim | Step 3: label with justification>",
+  "label": "<true|partially true|false>"
+}"""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -264,8 +294,8 @@ def main():
         help="Sampling temperature (default: 0.1)"
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=512,
-        help="Max output tokens per inference (default: 512)"
+        "--max-tokens", type=int, default=1024,
+        help="Max output tokens per inference (default: 1024)"
     )
     parser.add_argument(
         "--start", type=int, default=1,
