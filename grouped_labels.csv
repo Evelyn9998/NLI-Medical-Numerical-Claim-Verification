@@ -26,15 +26,18 @@ Calculator ID,Label,count
 10,false,20
 10,partially true,20
 10,true,20
+11,false,20
+11,partially true,20
+11,true,20
 15,false,20
 15,partially true,20
 15,true,20
 16,false,20
 16,partially true,20
 16,true,20
-17,false,20
-17,partially true,20
-17,true,20
+17,false,19
+17,partially true,19
+17,true,19
 18,false,20
 18,partially true,20
 18,true,20
@@ -50,12 +53,9 @@ Calculator ID,Label,count
 22,false,20
 22,partially true,20
 22,true,20
-23,false,5
-23,partially true,5
-23,true,5
-24,false,19
-24,partially true,19
-24,true,19
+23,false,4
+23,partially true,4
+23,true,4
 25,false,20
 25,partially true,20
 25,true,20
@@ -83,9 +83,9 @@ Calculator ID,Label,count
 38,false,11
 38,partially true,11
 38,true,11
-39,false,20
-39,partially true,20
-39,true,20
+39,false,19
+39,partially true,19
+39,true,19
 40,false,5
 40,partially true,5
 40,true,5
