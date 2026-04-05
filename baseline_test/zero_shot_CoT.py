@@ -1,19 +1,18 @@
 """
 LLM Fact-Check Evaluator
-Uses Llama-3.1-8B-Instruct via Groq API (free, no local GPU required).
+Uses Llama-3.1-8B-Instruct via local HuggingFace model.
 Zero-shot Direct Prompting: Evidence + Claim -> Label prediction with CoT.
 
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
 
 Install dependencies:
-    pip install groq
+    pip install transformers torch
 
 Usage:
-    export GROQ_API_KEY="your_groq_api_key_here"
-    python evaluate.py --data "train_300.csv"
-    python evaluate.py --data "train_300.csv" --samples 20 --random
-    python evaluate.py --data "train_300.csv" --samples 0
+    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct"
+    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 20 --random
+    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
 """
 
 import argparse
@@ -117,23 +116,47 @@ def load_dataset(csv_path: str) -> list:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(groq_model: str):
-    try:
-        from groq import Groq
-    except ImportError:
-        print("groq is not installed. Run:  pip install groq")
-        sys.exit(1)
+def load_model(model_name: str):
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("Error: GROQ_API_KEY environment variable not set.")
-        print("Get a free key at console.groq.com, then run:")
-        print('  export GROQ_API_KEY="gsk_..."')
-        sys.exit(1)
+    print(f"Loading model: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    print(f"Using Groq API  |  model: {groq_model}")
-    client = Groq(api_key=api_key)
-    return client, groq_model
+    has_gpu = torch.cuda.is_available()
+    print(f"  GPU available: {has_gpu}")
+
+    if has_gpu:
+        try:
+            from transformers import BitsAndBytesConfig
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+            print("  4-bit quantization enabled (bitsandbytes)")
+        except Exception as e:
+            print(f"  bitsandbytes not available ({e}), loading in fp16")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+    else:
+        print("  No GPU, loading on CPU (fp32)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+        )
+
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    print(f"Model ready: {model_name}")
+    return pipe, model_name
 
 
 # ---------------------------------------------------------------------------
@@ -142,24 +165,23 @@ def load_model(groq_model: str):
 
 def call_model(model, evidence: str, claim: str, ev_limit: int,
                temperature: float, max_tokens: int) -> dict:
-    client, groq_model = model
+    pipe, model_name = model
     user_msg = (
         f"Evidence:\n{evidence[:ev_limit]}\n\n"
         f"Claim:\n{claim}\n\n"
         "Respond only with the JSON object."
     )
 
-    response = client.chat.completions.create(
-        model=groq_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
+    do_sample = temperature > 0.0
+    result = pipe(
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user",   "content": user_msg}],
+        max_new_tokens=max_tokens,
+        temperature=temperature if do_sample else None,
+        do_sample=do_sample,
+        return_full_text=False,
     )
-
-    raw_text = response.choices[0].message.content.strip()
+    raw_text = result[0]["generated_text"].strip()
     clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
 
     try:
@@ -274,8 +296,8 @@ def main():
         help="Path to CSV dataset, e.g. train_200.csv"
     )
     parser.add_argument(
-        "--groq-model", default="llama-3.1-8b-instant",
-        help="Groq model name (default: llama-3.1-8b-instant)"
+        "--model", default="meta-llama/Llama-3.1-8B-Instruct",
+        help="HuggingFace model name or local path (default: meta-llama/Llama-3.1-8B-Instruct)"
     )
     parser.add_argument(
         "--samples", type=int, default=10,
@@ -324,7 +346,7 @@ def main():
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
     # Load model (Groq API client)
-    model = load_model(args.groq_model)
+    model = load_model(args.model)
 
     # Prepare output file (write header immediately)
     out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
