@@ -128,7 +128,6 @@ You are given:
 - A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, <entity_2> is <value_2>, ..., <entity_N> is <value_N>.")
 - The calculator name used
 - The EXACT computed value produced by a verified Python calculator function
-- The relevant entities extracted from the evidence (the ground-truth parameter values)
 
 Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE by following these steps carefully.
 
@@ -141,28 +140,34 @@ Step 1 — Entity verification (all entities EXCEPT the last one):
   - Compare the claim's value against the evidence note.
   - If an entity is NOT mentioned in the evidence, and the claim states it is "none" or "no", treat that entity as CORRECT.
   - If an entity is NOT mentioned in the evidence, and the claim states a non-zero or non-none value, treat that entity as INCORRECT.
-  - Count how many input entities are correct and how many are incorrect.
+  - An entity that is PARTIALLY CORRECT (some aspects right, some wrong) counts as INCORRECT.
+  - Count: how many entities are CORRECT and how many are INCORRECT (including partially correct ones).
 
 Step 2 — Calculation verification (the last entity in the claim):
-  The last entity in the claim is the computed result. Compare it against the EXACT computed value using these rules:
+  The last entity in the claim is the computed result for the named calculator. Compare it against the EXACT computed value:
+  - IMPORTANT: The calculator name above tells you exactly which entity to verify. Only compare the entity that represents the output of that specific calculator — ignore any other numeric values in the claim.
   - Rule-based calculators (scores, classifications): the claim value must EXACTLY match the computed value.
   - Equation-based calculators (lab tests, physical measurements, dosage conversions): the claim value must be within 5% of the computed value.
   - Date-based calculators: the claim date must EXACTLY match the computed date.
 
-Step 3 — Assign label (read ALL three definitions carefully before choosing):
+Step 3 — Assign label (read ALL four definitions carefully before choosing):
   - "true":           ALL input entities (Step 1) are correct AND the computed result (Step 2) is correct.
   - "partially true": ALL input entities (Step 1) are correct AND the computed result (Step 2) is WRONG.
                       Use this when the inputs match evidence perfectly but the final answer is off.
-  - "false":          ONE OR MORE input entities (Step 1) are incorrect AND the computed result (Step 2) is also WRONG.
-                      Use this ONLY when there is an input entity error — do NOT use "false" just because the result is wrong.
+  - "false":          ONE OR MORE input entities (Step 1) are incorrect, regardless of whether the result is correct or wrong.
+                      Mixed entity case: if SOME entities are correct and OTHERS are incorrect, that still qualifies as "false" — having some correct entities does NOT prevent "false".
+                      Even if the computed result happens to match the claim, input entity errors mean the label is "false".
 
-CRITICAL RULE: The label "false" requires an input entity error. If all inputs are correct, you MUST choose "true" or "partially true", never "false".
+CRITICAL RULES:
+- "false" requires at least one incorrect input entity. If ALL inputs are correct, you MUST choose "true" or "partially true".
+- Input entity errors always take priority: one or more incorrect entities → "false", no matter what the result is.
+- You MUST end your response with the JSON object. Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
 
 ---
 
-Show your work for each step, then output ONLY this JSON (no markdown fences):
+Output ONLY this JSON (no markdown fences):
 {
-  "reasoning": "<step-by-step verification: entity check, formula used, calculation process, comparison with claim>",
+  "reasoning": "<concise verification: summarize entity correctness, state computed vs claim result, assign label>",
   "label": "<true|false|partially true>"
 }"""
 
@@ -319,6 +324,47 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
 
 _CALC_NAME_TO_ID: dict = {}
 
+# Explicit aliases for common classifier output names that don't match _CALCULATOR_LIST
+_CALC_ALIASES: dict = {
+    # Wells' DVT (ID 16)
+    "wells' criteria for dvt": 16,
+    "wells criteria for dvt": 16,
+    "wells' criteria for deep vein thrombosis": 16,
+    "wells dvt criteria": 16,
+    "wells dvt score": 16,
+    # Wells' PE (ID 8)
+    "wells' criteria for pulmonary embolism": 8,
+    "wells criteria for pulmonary embolism": 8,
+    "wells' pe criteria": 8,
+    "wells' criteria for pe": 8,
+    "wells pe score": 8,
+    # Maintenance Fluids (ID 22)
+    "maintenance fluids calculations": 22,
+    "maintenance fluids calculation": 22,
+    "maintenance fluid calculations": 22,
+    "holliday-segar": 22,
+    "holliday segar": 22,
+    # Estimated Date of Conception (ID 68)
+    "estimated of conception": 68,
+    "estimated date of conception": 68,
+    "estimated conception date": 68,
+    "date of conception": 68,
+    # Body Surface Area (ID 60)
+    "body surface area calculator": 60,
+    "body surface area (mosteller)": 60,
+    "bsa (mosteller)": 60,
+    "bsa calculator": 60,
+    "body surface area": 60,
+    # PSI (ID 29)
+    "pneumonia severity index": 29,
+    "psi score": 29,
+    "psi: pneumonia severity index": 29,
+    # CCI (ID 32)
+    "charlson comorbidity index": 32,
+    "cci score": 32,
+}
+
+
 def _build_name_to_id() -> dict:
     """Parse _CALCULATOR_LIST once and return a {lowercased_name: id} dict."""
     mapping: dict = {}
@@ -338,16 +384,41 @@ def _resolve_calculator_id(calc_name: str) -> int:
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
 
-    key = calc_name.lower()
+    key = calc_name.lower().strip()
+
+    # 1. Exact match in calculator list
     if key in _CALC_NAME_TO_ID:
         return _CALC_NAME_TO_ID[key]
 
-    # Fuzzy: find the list entry whose name best overlaps with the classifier output
+    # 2. Exact match in explicit aliases
+    if key in _CALC_ALIASES:
+        return _CALC_ALIASES[key]
+
+    # 3. Partial match in explicit aliases
+    for alias, cid in _CALC_ALIASES.items():
+        if alias in key or key in alias:
+            return cid
+
+    # 4. Substring match in calculator list
     for name, cid in _CALC_NAME_TO_ID.items():
         if name in key or key in name:
             return cid
 
+    # 5. Word-overlap: find list entry with most shared significant words
+    key_words = set(re.findall(r'\w{3,}', key))
+    best_cid, best_overlap = 0, 0
+    for name, cid in _CALC_NAME_TO_ID.items():
+        name_words = set(re.findall(r'\w{3,}', name))
+        overlap = len(key_words & name_words)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_cid = cid
+    if best_overlap >= 3:
+        return best_cid
+
     return 0  # unknown — run_calculator will fail gracefully
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -501,8 +572,8 @@ def main():
                         help="Sampling temperature (default: 0.0)")
     parser.add_argument("--max-tokens-step1", type=int, default=1024,
                         help="Max tokens for Step 1 (default: 1024)")
-    parser.add_argument("--max-tokens-step3", type=int, default=512,
-                        help="Max tokens for Step 3 (default: 512)")
+    parser.add_argument("--max-tokens-step3", type=int, default=1024,
+                        help="Max tokens for Step 3 (default: 1024)")
     parser.add_argument("--delay",      type=float, default=2.0,
                         help="Seconds between samples (default: 2.0)")
     parser.add_argument("--output",     default="",
