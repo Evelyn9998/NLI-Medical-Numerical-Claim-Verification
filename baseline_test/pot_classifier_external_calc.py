@@ -155,39 +155,36 @@ You are given:
 - The EXACT computed value produced by a verified Python calculator function
 - The relevant entities extracted from the evidence (the ground-truth parameter values)
 
-Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE by following these steps carefully.
+Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE.
 
 ---
 
-STEP-BY-STEP VERIFICATION PROCEDURE:
+VERIFICATION RULES:
 
 Step 1 — Entity verification (all entities EXCEPT the last one):
-  The claim lists entities in the form "<n> is <value>". Check each entity except the LAST one:
-  - Compare the claim's value against the evidence note.
-  - If an entity is NOT mentioned in the evidence, and the claim states it is "none" or "no", treat that entity as CORRECT.
-  - If an entity is NOT mentioned in the evidence, and the claim states a non-zero or non-none value, treat that entity as INCORRECT.
-  - Count how many input entities are correct and how many are incorrect.
+  - Compare each claim entity against the evidence. Count correct vs incorrect.
+  - Entity absent from evidence + claim says "none"/"no" → CORRECT.
+  - Entity absent from evidence + claim gives a non-zero value → INCORRECT.
 
-Step 2 — Calculation verification (the last entity in the claim):
-  The last entity in the claim is the computed result. Compare it against the EXACT computed value using these rules:
-  - Rule-based calculators (scores, classifications): the claim value must EXACTLY match the computed value.
-  - Equation-based calculators (lab tests, physical measurements, dosage conversions): the claim value must be within 5% of the computed value.
-  - Date-based calculators: the claim date must EXACTLY match the computed date.
+Step 2 — Calculation verification (the LAST entity in the claim):
+  - Rule-based calculators (scores): claim value must EXACTLY match computed value.
+  - Equation-based calculators (labs, measurements): claim value must be within 5% of computed value.
+  - Date-based calculators: claim date must EXACTLY match computed date.
 
-Step 3 — Assign label (read ALL three definitions carefully before choosing):
-  - "true":           ALL input entities (Step 1) are correct AND the computed result (Step 2) is correct.
-  - "partially true": ALL input entities (Step 1) are correct AND the computed result (Step 2) is WRONG.
-                      Use this when the inputs match evidence perfectly but the final answer is off.
-  - "false":          ONE OR MORE input entities (Step 1) are incorrect AND the computed result (Step 2) is also WRONG.
-                      Use this ONLY when there is an input entity error — do NOT use "false" just because the result is wrong.
-
-CRITICAL RULE: The label "false" requires an input entity error. If all inputs are correct, you MUST choose "true" or "partially true", never "false".
+Step 3 — Label:
+  - "true":           ALL inputs correct AND result correct.
+  - "partially true": ALL inputs correct AND result WRONG.
+  - "false":          ONE OR MORE inputs incorrect AND result WRONG.
+  CRITICAL: "false" requires an input error. Correct inputs → "true" or "partially true" only.
 
 ---
 
-Show your work for each step, then output ONLY this JSON (no markdown fences):
+OUTPUT FORMAT:
+1. First line MUST be: VERDICT: <true|false|partially true>
+2. Then show your concise step-by-step reasoning (3-5 sentences, no rule repetition).
+3. Finally output the JSON (no markdown fences):
 {
-  "reasoning": "<step-by-step verification: entity check, formula used, calculation process, comparison with claim>",
+  "reasoning": "<same concise reasoning>",
   "label": "<true|false|partially true>"
 }"""
 
@@ -286,6 +283,67 @@ def _chat(pipe, _model_name, messages, temperature, max_tokens):
 
 _CALC_NAME_TO_ID: dict = {}
 
+# Explicit aliases for known FormulaClassifier output names that differ from
+# the abbreviated names used in _CALCULATOR_LIST.
+_CLASSIFIER_ALIASES: dict = {
+    # Wells' DVT (ID 16)
+    "wells' criteria for dvt":                    16,
+    "wells criteria for dvt":                     16,
+    "wells' criteria for deep vein thrombosis":   16,
+    "wells' dvt criteria":                        16,
+    "wells dvt criteria":                         16,
+    "wells dvt score":                            16,
+    "wells dvt":                                  16,
+    # Wells' PE (ID 8)
+    "wells' criteria for pulmonary embolism":     8,
+    "wells criteria for pulmonary embolism":      8,
+    "wells' criteria for pe":                     8,
+    "wells' pe criteria":                         8,
+    "wells pe score":                             8,
+    "wells pe":                                   8,
+    # Maintenance Fluids (ID 22)
+    "maintenance fluids calculations":            22,
+    "maintenance fluids calculation":             22,
+    "maintenance fluid calculations":             22,
+    "holliday-segar":                             22,
+    "holliday segar":                             22,
+    # Centor / McIsaac (ID 20)
+    "centor score (modified/mcisaac)":            20,
+    "centor score":                               20,
+    "modified centor score":                      20,
+    "mcisaac score":                              20,
+    "centor/mcisaac score":                       20,
+    # CCI (ID 32)
+    "charlson comorbidity index":                 32,
+    "cci score":                                  32,
+    "cci":                                        32,
+    # PSI (ID 29)
+    "psi score":                                  29,
+    "pneumonia severity index":                   29,
+    "psi: pneumonia severity index":              29,
+    # HEART (ID 18)
+    "heart score":                                18,
+    # Body Surface Area (ID 60)
+    "body surface area":                          60,
+    "body surface area calculator":               60,
+    "body surface area (mosteller)":              60,
+    "bsa (mosteller)":                            60,
+    "bsa calculator":                             60,
+    # Estimated Date of Conception (ID 68)
+    "estimated date of conception":               68,
+    "estimated of conception":                    68,
+    "estimated conception date":                  68,
+    "date of conception":                         68,
+}
+
+# Stop-words to ignore when doing word-overlap matching
+_MATCH_STOP = frozenset({
+    'the', 'a', 'an', 'for', 'of', 'and', 'or', 'score', 'index',
+    'calculation', 'calculations', 'calculator', 'criteria', 'modified',
+    'based', 's', 'by', 'rule',
+})
+
+
 def _build_name_to_id() -> dict:
     """Parse _CALCULATOR_LIST once and return a {lowercased_name: id} dict."""
     mapping: dict = {}
@@ -305,14 +363,33 @@ def _resolve_calculator_id(calc_name: str) -> int:
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
 
-    key = calc_name.lower()
+    key = calc_name.lower().strip()
+
+    # 1. Exact match against parsed list
     if key in _CALC_NAME_TO_ID:
         return _CALC_NAME_TO_ID[key]
 
-    # Fuzzy: find the list entry whose name best overlaps with the classifier output
+    # 2. Explicit alias table (handles FormulaClassifier full-name outputs)
+    if key in _CLASSIFIER_ALIASES:
+        return _CLASSIFIER_ALIASES[key]
+
+    # 3. Substring match (original logic)
     for name, cid in _CALC_NAME_TO_ID.items():
         if name in key or key in name:
             return cid
+
+    # 4. Word-overlap fallback: pick the list entry with most shared non-stop words
+    key_words = set(re.findall(r'[a-z0-9]+', key)) - _MATCH_STOP
+    best_id, best_overlap = 0, 0
+    for name, cid in _CALC_NAME_TO_ID.items():
+        name_words = set(re.findall(r'[a-z0-9]+', name)) - _MATCH_STOP
+        overlap = len(key_words & name_words)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_id = cid
+
+    if best_overlap >= 3:
+        return best_id
 
     return 0  # unknown — run_calculator will fail gracefully
 
@@ -368,11 +445,15 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
                  {"role": "user",   "content": user_msg}],
                 temperature, max_tokens)
 
-    # Extract code block
+    # Extract code block (closed fence preferred; fall back to truncated output)
     code_match = re.search(r"```python([\s\S]*?)```", raw, re.IGNORECASE)
     if not code_match:
-        # Fallback: try bare code block
         code_match = re.search(r"```([\s\S]*?)```", raw)
+    if not code_match:
+        # Truncated output: closing ``` was cut off — take everything after the opening fence
+        code_match = re.search(r"```python([\s\S]+)", raw, re.IGNORECASE)
+    if not code_match:
+        code_match = re.search(r"```([\s\S]+)", raw)
 
     exec_error = ""
     params = {}
@@ -422,12 +503,14 @@ def step3_verdict(client, model, item: dict,
                     if computed.get("value") is not None
                     else f"[calculation error: {computed.get('note', 'unknown')}]")
 
+    relevant = item.get("relevant_entities", "").strip()
     user_msg = (
         f"Evidence:\n{item['evidence'][:ev_limit]}\n\n"
         f"Claim:\n{item['claim']}\n\n"
         f"Calculator used: {item['calculator_name']}\n"
-        f"Computed result (exact, from verified Python function): {computed_str}\n\n"
-        "Verify the claim step by step and output the JSON label."
+        f"Computed result (exact, from verified Python function): {computed_str}\n"
+        + (f"Relevant entities from evidence: {relevant}\n\n" if relevant else "\n")
+        + "Output the JSON verdict now."
     )
 
     raw = _chat(client, model,
@@ -436,20 +519,33 @@ def step3_verdict(client, model, item: dict,
                 temperature, max_tokens)
 
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-    try:
-        parsed = json.loads(clean)
-        return {
-            "reasoning": parsed.get("reasoning", ""),
-            "label":     normalize_label(parsed.get("label", "")),
-        }
-    except json.JSONDecodeError:
-        lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
-        rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
-        label = normalize_label(lm.group(1)) if lm else _fallback_label(clean)
-        return {
-            "reasoning": rm.group(1) if rm else clean,
-            "label":     label,
-        }
+
+    # Extract VERDICT: line early — used as fallback if JSON is truncated
+    verdict_match = re.search(r"^VERDICT\s*:\s*(.+)$", clean, re.IGNORECASE | re.MULTILINE)
+    verdict_label = normalize_label(verdict_match.group(1).strip()) if verdict_match else ""
+
+    # Find JSON object in the output (may appear after the VERDICT line + reasoning)
+    json_match = re.search(r"\{[\s\S]*\}", clean)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            return {
+                "reasoning": parsed.get("reasoning", ""),
+                "label":     normalize_label(parsed.get("label", "")),
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # JSON absent or malformed — try inline regex, then fall back to VERDICT line
+    lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
+    rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
+    label = (normalize_label(lm.group(1)) if lm
+             else verdict_label if verdict_label
+             else _fallback_label(clean))
+    return {
+        "reasoning": rm.group(1) if rm else clean,
+        "label":     label,
+    }
 
 
 def _fallback_label(text: str) -> str:
@@ -554,10 +650,10 @@ def main():
                         help="Max evidence characters (default: 3000)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (default: 0.0)")
-    parser.add_argument("--max-tokens-step1", type=int, default=1024,
-                        help="Max tokens for Step 1 (default: 1024)")
-    parser.add_argument("--max-tokens-step3", type=int, default=512,
-                        help="Max tokens for Step 3 (default: 512)")
+    parser.add_argument("--max-tokens-step1", type=int, default=2048,
+                        help="Max tokens for Step 1 (default: 2048)")
+    parser.add_argument("--max-tokens-step3", type=int, default=1024,
+                        help="Max tokens for Step 3 (default: 1024)")
     parser.add_argument("--delay",      type=float, default=2.0,
                         help="Seconds between samples (default: 2.0)")
     parser.add_argument("--output",     default="",
