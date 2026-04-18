@@ -179,6 +179,7 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
         max_new_tokens=max_tokens,
         temperature=temperature if do_sample else None,
         do_sample=do_sample,
+        repetition_penalty=1.2,
         return_full_text=False,
     )
     raw_text = result[0]["generated_text"].strip()
@@ -316,8 +317,8 @@ def main():
         help="Sampling temperature (default: 0.1)"
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=1024,
-        help="Max output tokens per inference (default: 1024)"
+        "--max-tokens", type=int, default=2048,
+        help="Max output tokens per inference (default: 2048)"
     )
     parser.add_argument(
         "--start", type=int, default=1,
@@ -377,7 +378,8 @@ def main():
                 )
                 predicted = normalize_label(resp["label"])
                 reasoning = resp["reasoning"]
-                break
+                if predicted != "unknown" or attempt == 2:
+                    break
             except Exception as e:
                 print(f"  [attempt {attempt+1}/3] Error: {e}")
                 if attempt < 2:

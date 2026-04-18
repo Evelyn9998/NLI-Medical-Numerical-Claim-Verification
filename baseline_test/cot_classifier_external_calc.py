@@ -161,6 +161,7 @@ Step 3 — Assign label (read ALL four definitions carefully before choosing):
 CRITICAL RULES:
 - "false" requires at least one incorrect input entity. If ALL inputs are correct, you MUST choose "true" or "partially true".
 - Input entity errors always take priority: one or more incorrect entities → "false", no matter what the result is.
+<<<<<<< HEAD
 - Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
 
 ---
@@ -171,6 +172,15 @@ OUTPUT FORMAT:
 3. Finally output the JSON (no markdown fences):
 {
   "reasoning": "<same concise reasoning>",
+=======
+- You MUST end your response with the JSON object. Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
+
+---
+
+Output ONLY this JSON (no markdown fences):
+{
+  "reasoning": "<concise verification: summarize entity correctness, state computed vs claim result, assign label>",
+>>>>>>> 8c08abb8f31557a7c5b07182edab3c4e6b0e5509
   "label": "<true|false|partially true>"
 }"""
 
