@@ -33,61 +33,61 @@ from train_formula_classifier import FormulaClassifier, QTC_VARIANTS
 
 # Calculator reference list shown to the model
 _CALCULATOR_LIST = """
-ID 2  — Creatinine Clearance (Cockcroft-Gault): age, weight(kg), creatinine(mg/dL), height(cm), sex
-ID 3  — CKD-EPI GFR: age, creatinine(mg/dL), sex, [race]
-ID 4  — CHA2DS2-VASc: age, sex, chf, hypertension, diabetes, stroke/tia, vascular_disease
-ID 5  — Mean Arterial Pressure: sbp(mmHg), dbp(mmHg)
-ID 6  — BMI: weight(kg), height(cm)
-ID 7  — Calcium Correction for Hypoalbuminemia: calcium(mg/dL), albumin(g/dL)
-ID 8  — Wells' PE: clinical signs of DVT, pe_top_diagnosis, heart_rate, immobilization, previous_dvt_pe, hemoptysis, malignancy
-ID 9  — MDRD GFR: age, creatinine(mg/dL), sex, [race]
-ID 10 — Ideal Body Weight: height(cm), sex
-ID 11 — QTc Bazett: qt_interval(ms), heart_rate(bpm)
-ID 13 — Estimated Due Date: last_menstrual_date(YYYY-MM-DD), [cycle_length=28]
-ID 15 — Child-Pugh: albumin(g/dL), bilirubin(mg/dL), inr, ascites(none/slight/moderate), encephalopathy(none/grade1-2/grade3-4)
-ID 16 — Wells' DVT: active_cancer, paralysis_paresis_plaster, bedridden_recently, major_surgery, localized_tenderness, entire_leg_swollen, calf_swelling, pitting_edema, collateral_veins, previous_dvt, alternative_diagnosis
-ID 17 — RCRI: high_risk_surgery, ischemic_heart_disease, chf, cerebrovascular_disease, insulin, creatinine(mg/dL)
-ID 18 — HEART Score: history(0-2), ecg(0-2), age, risk_factors(0-2), troponin(0-2)
-ID 19 — FIB-4: age, ast(U/L), alt(U/L), platelets(×10³/µL)
-ID 20 — Centor/McIsaac: age, temperature(°C), cough_absent, tonsillar_exudate, tender_anterior_cervical_lymph_nodes
-ID 21 — GCS: best_eye_response, best_verbal_response, best_motor_response
-ID 22 — Maintenance Fluids (Holliday-Segar): weight(kg)
-ID 23 — MELD Na: bilirubin(mg/dL), creatinine(mg/dL), inr, sodium(mEq/L), [dialysis=0]
-ID 24 — Steroid Conversion: input_steroid, dose(mg), target_steroid
-ID 25 — HAS-BLED: hypertension, renal_disease, liver_disease, stroke, prior_bleeding, labile_inr, age, medication, alcohol
-ID 26 — Sodium Correction for Hyperglycemia: sodium(mEq/L), glucose(mg/dL)
-ID 27 — Glasgow-Blatchford: bun(mg/dL), hemoglobin(g/dL), sbp(mmHg), sex, [heart_rate, melena, syncope, hepatic_disease, cardiac_failure]
-ID 28 — APACHE II: temperature(°C), map(mmHg), heart_rate, respiratory_rate, pao2, fio2, ph, sodium, potassium, creatinine, hematocrit, wbc, gcs, age, [acute_renal_failure, chronic_health, surgery_type]
-ID 29 — PSI: age, sex, nursing_home, neoplastic_disease, liver_disease, chf, cerebrovascular_disease, renal_disease, altered_mental_status, respiratory_rate, sbp, temperature, heart_rate, ph, bun, sodium, glucose, hematocrit, pao2, pleural_effusion
-ID 30 — Serum Osmolality: sodium(mEq/L), glucose(mg/dL), bun(mg/dL)
-ID 31 — HOMA-IR: insulin(µIU/mL), glucose(mg/dL)
-ID 32 — Charlson Comorbidity Index: age + various comorbidities (0/1 flags)
-ID 33 — FeverPAIN: fever, absence_of_cough_or_coryza, symptom_onset_3_days, purulent_tonsils, severe_tonsil_inflammation
-ID 36 — Caprini VTE: age, bmi, sex, various risk factors (0/1 flags)
-ID 38 — Free Water Deficit: sodium(mEq/L), weight(kg), age, sex
-ID 39 — Anion Gap: sodium(mEq/L), chloride(mEq/L), bicarbonate(mEq/L)
-ID 40 — FENa: sodium(mEq/L), urine_sodium(mEq/L), creatinine(mg/dL), urine_creatinine(mg/dL)
-ID 43 — SOFA: pao2, fio2, platelets, bilirubin, map, vasopressors, gcs, creatinine, [urine_output]
-ID 44 — LDL (Friedewald): total_cholesterol, hdl, triglycerides (all mg/dL)
-ID 45 — CURB-65: confusion, bun(mg/dL), respiratory_rate, sbp, dbp, age
-ID 46 — Framingham Risk Score: age, sex, total_cholesterol, hdl, sbp, bp_treated(0/1), smoker(0/1)
-ID 48 — PERC Rule: age, heart_rate, spo2(%), unilateral_leg_swelling, hemoptysis, recent_surgery, previous_dvt_pe, hormone_use
-ID 49 — MME Calculator: [drug]_dose_per_day for each opioid (morphine, oxycodone, hydrocodone, etc.)
-ID 51 — SIRS: temperature(°C), heart_rate, respiratory_rate, paco2, wbc(×10³/µL)
-ID 56 — QTc Fridericia: qt_interval(ms), heart_rate(bpm)
-ID 57 — QTc Framingham: qt_interval(ms), heart_rate(bpm)
-ID 58 — QTc Hodges: qt_interval(ms), heart_rate(bpm)
-ID 59 — QTc Rautaharju: qt_interval(ms), heart_rate(bpm)
-ID 60 — Body Surface Area (Mosteller): height(cm), weight(kg)
-ID 61 — Target Weight: bmi(kg/m²), height(cm)
-ID 62 — Adjusted Body Weight: weight(kg), height(cm), sex
-ID 63 — Delta Gap: sodium, chloride, bicarbonate (mEq/L)
-ID 64 — Delta Ratio: sodium, chloride, bicarbonate (mEq/L)
-ID 65 — Albumin Corrected Anion Gap: sodium, chloride, bicarbonate (mEq/L), albumin(g/dL)
-ID 66 — Albumin Corrected Delta Gap: sodium, chloride, bicarbonate (mEq/L), albumin(g/dL)
-ID 67 — Albumin Corrected Delta Ratio: sodium, chloride, bicarbonate (mEq/L), albumin(g/dL)
-ID 68 — Estimated Date of Conception: last_menstrual_date(YYYY-MM-DD)
-ID 69 — Estimated Gestational Age: last_menstrual_date(YYYY-MM-DD), current_date(YYYY-MM-DD)
+ID 2  — Creatinine Clearance (Cockcroft-Gault Equation): age, creatinine, height, sex, weight
+ID 3  — CKD-EPI Equations for Glomerular Filtration Rate: age, creatinine, sex
+ID 4  — CHA2DS2-VASc Score for Atrial Fibrillation Stroke Risk: Congestive Heart Failure, Diabetes history, Hypertension history, Stroke, Thromboembolism history, Transient Ischemic Attacks History, Vascular disease history, age, sex
+ID 5  — Mean Arterial Pressure (MAP): Diastolic Blood Pressure, Systolic Blood Pressure
+ID 6  — Body Mass Index (BMI): height, weight
+ID 7  — Calcium Correction for Hypoalbuminemia: Albumin, Calcium
+ID 8  — Wells' Criteria for Pulmonary Embolism: Clinical signs and symptoms of Deep Vein Thrombosis, Heart Rate or Pulse, Hemoptysis, Immobilization for at least 3 days, Malignancy with treatment within 6 months or palliative, Previously Documented Pulmonary Embolism, Previously documented Deep Vein Thrombosis, Pulmonary Embolism is #1 diagnosis OR equally likely, Surgery in the previous 4 weeks
+ID 9  — MDRD GFR Equation: Race, age, creatinine, sex
+ID 10 — Ideal Body Weight: height, sex
+ID 11 — QTc Bazett Calculator: Heart Rate or Pulse, QT Interval
+ID 13 — Estimated Due Date: Last menstrual date, cycle length
+ID 15 — Child-Pugh Score for Cirrhosis Mortality: Albumin, Ascites, Bilirubin, Encephalopathy, international normalized ratio
+ID 16 — Wells' Criteria for DVT: Active cancer, Alternative diagnosis to Deep Vein Thrombosis as likely or more likely, Bedridden recently >3 days, Calf swelling >3 centimeters compared to the other leg, Collateral (nonvaricose) superficial veins present, Entire Leg Swollen, Localized tenderness along the deep venous system, Major surgery within 12 weeks, Paralysis, paresis, or recent plaster immobilization of the lower extremity, Pitting edema, confined to symptomatic leg, Previously documented Deep Vein Thrombosis
+ID 17 — Revised Cardiac Risk Index for Pre-Operative Risk: Congestive Heart Failure criteria for the Cardiac Risk Index rule, Elevated-risk surgery, History of cerebrovascular disease, History of ischemic heart disease, Pre-operative creatinine, Pre-operative treatment with insulin
+ID 18 — HEART Score for Major Cardiac Events: Diabetes mellitus, Electrocardiogram Test, Hypertension history, Initial troponin, Suspicion History, Transient Ischemic Attacks History, age, atherosclerotic disease, hypercholesterolemia, obesity, parent or sibling with Cardiovascular disease before age 65, smoking
+ID 19 — Fibrosis-4 (FIB-4) Index for Liver Fibrosis: Alanine aminotransferase, Aspartate aminotransferase, Platelet count, age
+ID 20 — Centor Score (Modified/McIsaac) for Strep Pharyngitis: Cough Absent, Exudate or swelling on tonsils, Temperature, Tender/swollen anterior cervical lymph nodes, age
+ID 21 — Glasgow Coma Score (GCS): Best eye response, Best motor response, Best verbal response
+ID 22 — Maintenance Fluids Calculations: weight
+ID 23 — MELD Na (UNOS/OPTN): Bilirubin, Continuous veno-venous hemodialysis for ≥4 hours in the past week, Dialysis at least twice in the past week, Sodium, creatinine, international normalized ratio
+ID 24 — Steroid Conversion Calculator: input steroid, target steroid
+ID 25 — HAS-BLED Score for Major Bleeding Risk: Hypertension, Labile international normalized ratio, Liver disease criteria for the HAS-BLED rule, Medication usage predisposing to bleeding, Number of Alcoholic Drinks Per Week, Prior major bleeding or predisposition to bleeding, Renal disease criteria for the HAS-BLED rule, Stroke, age
+ID 26 — Sodium Correction for Hyperglycemia: Glucose, Sodium
+ID 27 — Glasgow-Blatchford Bleeding Score (GBS): Blood Urea Nitrogen (BUN), Cardiac Failure Present, Heart Rate or Pulse, Hemoglobin, Hepatic disease history, Melena Present, Recent Syncope, Systolic Blood Pressure, sex
+ID 28 — APACHE II Score: A-a gradient, Acute renal failure, Chronic renal failure, Diastolic Blood Pressure, FiO2, Glasgow Coma Score, Heart Rate or Pulse, Hematocrit, History of severe organ failure or immunocompromise, PaO2, Potassium, Sodium, Surgery Type, Systolic Blood Pressure, Temperature, White blood cell count, age, creatinine, pH, respiratory rate
+ID 29 — PSI Score: Pneumonia Severity Index for CAP: Altered mental status, Blood Urea Nitrogen (BUN), Cerebrovascular disease history, Congestive Heart Failure, Glucose, Heart Rate or Pulse, Hematocrit, Liver disease history, Neoplastic disease, Nursing home resident, Partial pressure of oxygen, Pleural effusion on x-ray, Renal disease history, Sodium, Systolic Blood Pressure, Temperature, age, pH, respiratory rate, sex
+ID 30 — Serum Osmolality: Blood Urea Nitrogen (BUN), Glucose, Sodium
+ID 31 — HOMA-IR (Homeostatic Model Assessment for Insulin Resistance): Glucose, Insulin
+ID 32 — Charlson Comorbidity Index (CCI): AIDS, Cerebrovascular Accident, Chronic Pulmonary Disease, Congestive Heart Failure, Connective tissue disease, Dementia, Diabetes mellitus, Hemiplegia, Leukemia, Liver disease severity, Lymphoma, Moderate to severe Chronic Kidney Disease, Myocardial infarction, Peptic ulcer disease, Peripheral vascular disease, Solid tumor, Transient Ischemic Attacks History, age
+ID 33 — FeverPAIN Score for Strep Pharyngitis: Absence of cough or coryza, Fever in past 24 hours, Purulent tonsils, Severe tonsil inflammation, Symptom onset <=3 days
+ID 36 — Caprini Score for Venous Thromboembolism (2005): Acute Myocardial infarction, Acute spinal cord injury causing paralysis in the last month, Body Mass Index (BMI), Chronic Obstructive Pulmonary Disease, Congestive Heart Failure in the last month, Current central venous access, Current swollen legs, Elevated anticardiolipin antibody, Elevated serum homocysteine, Family history of thrombosis, Heparin-induced thrombocytopenia, Hip, pelvis, or leg fracture in the last month, History of inflammatory bowel disease, Immobilizing plaster cast in the last month, Major Surgery in the last month, Mobility, Multiple trauma in the last month, Other congenital or acquired thrombophilia, Pneumonia in the last month, Positive Factor V Leiden, Positive lupus anticoagulant, Positive prothrombin 20210A, Present or previous malignancy, Previously Documented Pulmonary Embolism, Previously documented Deep Vein Thrombosis, Sepsis in the last month, Stroke in the last month, Surgery Type, Varicose veins, age, sex
+ID 38 — Free Water Deficit: Sodium, age, sex, weight
+ID 39 — Anion Gap: Bicarbonate, Chloride, Sodium
+ID 40 — Fractional Excretion of Sodium (FENa): Sodium, Urine creatinine, Urine sodium, creatinine
+ID 43 — Sequential Organ Failure Assessment (SOFA) Score: Bilirubin, Continuous positive airway pressure, DOBUTamine, DOPamine, Diastolic Blood Pressure, FiO2, Glasgow Coma Score, Hypotension, On mechanical ventilation, PaO2, Platelet count, Systolic Blood Pressure, Urine Output, creatinine
+ID 44 — LDL Calculated: Total cholesterol, Triglycerides, high-density lipoprotein cholesterol
+ID 45 — CURB-65 Score for Pneumonia Severity: Blood Urea Nitrogen (BUN), Confusion, Diastolic Blood Pressure, Systolic Blood Pressure, age, respiratory rate
+ID 46 — Framingham Risk Score for Hard Coronary Heart Disease: Blood pressure being treated with medicines, Smoker, Systolic Blood Pressure, Total cholesterol, age, high-density lipoprotein cholesterol, sex
+ID 48 — PERC Rule for Pulmonary Embolism: Heart Rate or Pulse, Hemoptysis, Hormone use, O2 saturation percentage, Previously Documented Pulmonary Embolism, Previously documented Deep Vein Thrombosis, Recent surgery or trauma, Unilateral Leg Swelling, age
+ID 49 — Morphine Milligram Equivalents (MME) Calculator: Codeine Dose, Codeine Dose Per Day, FentaNYL buccal Dose, FentaNYL buccal Dose Per Day, HYDROcodone Dose, HYDROcodone Dose Per Day, HYDROmorphone Dose, HYDROmorphone Dose Per Day, Methadone Dose, Methadone Dose Per Day, Morphine Dose, Morphine Dose Per Day, OxyCODONE Dose, OxyCODONE Dose Per Day, OxyMORphone Dose, OxyMORphone Dose Per Day, Tapentadol Dose, Tapentadol Dose Per Day, TraMADol Dose, TraMADol Dose Per Day
+ID 51 — SIRS Criteria: Heart Rate or Pulse, PaCO2, Temperature, White blood cell count, respiratory rate
+ID 56 — QTc Fridericia Calculator: Heart Rate or Pulse, QT Interval
+ID 57 — QTc Framingham Calculator: Heart Rate or Pulse, QT Interval
+ID 58 — QTc Hodges Calculator: Heart Rate or Pulse, QT Interval
+ID 59 — QTc Rautaharju Calculator: Heart Rate or Pulse, QT Interval
+ID 60 — Body Surface Area Calculator: height, weight
+ID 61 — Target weight: Body Mass Index (BMI), height
+ID 62 — Adjusted Body Weight: height, sex, weight
+ID 63 — Delta Gap: Bicarbonate, Chloride, Sodium
+ID 64 — Delta Ratio: Bicarbonate, Chloride, Sodium
+ID 65 — Albumin Corrected Anion Gap: Albumin, Bicarbonate, Chloride, Sodium
+ID 66 — Albumin Corrected Delta Gap: Albumin, Bicarbonate, Chloride, Sodium
+ID 67 — Albumin Corrected Delta Ratio: Albumin, Bicarbonate, Chloride, Sodium
+ID 68 — Estimated Date of Conception: Last menstrual date
+ID 69 — Estimated Gestational Age: Current Date, Last menstrual date
 """
 
 STEP1_SYSTEM = f"""You are a clinical data extraction assistant. Your job is to read a medical evidence note and extract the exact parameter values needed for a specific medical calculator.
@@ -128,7 +128,6 @@ You are given:
 - A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, <entity_2> is <value_2>, ..., <entity_N> is <value_N>.")
 - The calculator name used
 - The EXACT computed value produced by a verified Python calculator function
-- The relevant entities extracted from the evidence (the ground-truth parameter values)
 
 Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE by following these steps carefully.
 
@@ -141,28 +140,37 @@ Step 1 — Entity verification (all entities EXCEPT the last one):
   - Compare the claim's value against the evidence note.
   - If an entity is NOT mentioned in the evidence, and the claim states it is "none" or "no", treat that entity as CORRECT.
   - If an entity is NOT mentioned in the evidence, and the claim states a non-zero or non-none value, treat that entity as INCORRECT.
-  - Count how many input entities are correct and how many are incorrect.
+  - An entity that is PARTIALLY CORRECT (some aspects right, some wrong) counts as INCORRECT.
+  - Count: how many entities are CORRECT and how many are INCORRECT (including partially correct ones).
 
 Step 2 — Calculation verification (the last entity in the claim):
-  The last entity in the claim is the computed result. Compare it against the EXACT computed value using these rules:
+  The last entity in the claim is the computed result for the named calculator. Compare it against the EXACT computed value:
+  - IMPORTANT: The calculator name above tells you exactly which entity to verify. Only compare the entity that represents the output of that specific calculator — ignore any other numeric values in the claim.
   - Rule-based calculators (scores, classifications): the claim value must EXACTLY match the computed value.
   - Equation-based calculators (lab tests, physical measurements, dosage conversions): the claim value must be within 5% of the computed value.
   - Date-based calculators: the claim date must EXACTLY match the computed date.
 
-Step 3 — Assign label (read ALL three definitions carefully before choosing):
+Step 3 — Assign label (read ALL four definitions carefully before choosing):
   - "true":           ALL input entities (Step 1) are correct AND the computed result (Step 2) is correct.
   - "partially true": ALL input entities (Step 1) are correct AND the computed result (Step 2) is WRONG.
                       Use this when the inputs match evidence perfectly but the final answer is off.
-  - "false":          ONE OR MORE input entities (Step 1) are incorrect AND the computed result (Step 2) is also WRONG.
-                      Use this ONLY when there is an input entity error — do NOT use "false" just because the result is wrong.
+  - "false":          ONE OR MORE input entities (Step 1) are incorrect, regardless of whether the result is correct or wrong.
+                      Mixed entity case: if SOME entities are correct and OTHERS are incorrect, that still qualifies as "false" — having some correct entities does NOT prevent "false".
+                      Even if the computed result happens to match the claim, input entity errors mean the label is "false".
 
-CRITICAL RULE: The label "false" requires an input entity error. If all inputs are correct, you MUST choose "true" or "partially true", never "false".
+CRITICAL RULES:
+- "false" requires at least one incorrect input entity. If ALL inputs are correct, you MUST choose "true" or "partially true".
+- Input entity errors always take priority: one or more incorrect entities → "false", no matter what the result is.
+- Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
 
 ---
 
-Show your work for each step, then output ONLY this JSON (no markdown fences):
+OUTPUT FORMAT:
+1. First line MUST be: VERDICT: <true|false|partially true>
+2. Then show your concise step-by-step reasoning (3-5 sentences, no rule repetition).
+3. Finally output the JSON (no markdown fences):
 {
-  "reasoning": "<step-by-step verification: entity check, formula used, calculation process, comparison with claim>",
+  "reasoning": "<same concise reasoning>",
   "label": "<true|false|partially true>"
 }"""
 
@@ -319,6 +327,47 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
 
 _CALC_NAME_TO_ID: dict = {}
 
+# Explicit aliases for common classifier output names that don't match _CALCULATOR_LIST
+_CALC_ALIASES: dict = {
+    # Wells' DVT (ID 16)
+    "wells' criteria for dvt": 16,
+    "wells criteria for dvt": 16,
+    "wells' criteria for deep vein thrombosis": 16,
+    "wells dvt criteria": 16,
+    "wells dvt score": 16,
+    # Wells' PE (ID 8)
+    "wells' criteria for pulmonary embolism": 8,
+    "wells criteria for pulmonary embolism": 8,
+    "wells' pe criteria": 8,
+    "wells' criteria for pe": 8,
+    "wells pe score": 8,
+    # Maintenance Fluids (ID 22)
+    "maintenance fluids calculations": 22,
+    "maintenance fluids calculation": 22,
+    "maintenance fluid calculations": 22,
+    "holliday-segar": 22,
+    "holliday segar": 22,
+    # Estimated Date of Conception (ID 68)
+    "estimated of conception": 68,
+    "estimated date of conception": 68,
+    "estimated conception date": 68,
+    "date of conception": 68,
+    # Body Surface Area (ID 60)
+    "body surface area calculator": 60,
+    "body surface area (mosteller)": 60,
+    "bsa (mosteller)": 60,
+    "bsa calculator": 60,
+    "body surface area": 60,
+    # PSI (ID 29)
+    "pneumonia severity index": 29,
+    "psi score": 29,
+    "psi: pneumonia severity index": 29,
+    # CCI (ID 32)
+    "charlson comorbidity index": 32,
+    "cci score": 32,
+}
+
+
 def _build_name_to_id() -> dict:
     """Parse _CALCULATOR_LIST once and return a {lowercased_name: id} dict."""
     mapping: dict = {}
@@ -338,16 +387,41 @@ def _resolve_calculator_id(calc_name: str) -> int:
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
 
-    key = calc_name.lower()
+    key = calc_name.lower().strip()
+
+    # 1. Exact match in calculator list
     if key in _CALC_NAME_TO_ID:
         return _CALC_NAME_TO_ID[key]
 
-    # Fuzzy: find the list entry whose name best overlaps with the classifier output
+    # 2. Exact match in explicit aliases
+    if key in _CALC_ALIASES:
+        return _CALC_ALIASES[key]
+
+    # 3. Partial match in explicit aliases
+    for alias, cid in _CALC_ALIASES.items():
+        if alias in key or key in alias:
+            return cid
+
+    # 4. Substring match in calculator list
     for name, cid in _CALC_NAME_TO_ID.items():
         if name in key or key in name:
             return cid
 
+    # 5. Word-overlap: find list entry with most shared significant words
+    key_words = set(re.findall(r'\w{3,}', key))
+    best_cid, best_overlap = 0, 0
+    for name, cid in _CALC_NAME_TO_ID.items():
+        name_words = set(re.findall(r'\w{3,}', name))
+        overlap = len(key_words & name_words)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_cid = cid
+    if best_overlap >= 3:
+        return best_cid
+
     return 0  # unknown — run_calculator will fail gracefully
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,21 +452,33 @@ def step3_verdict(client, model, item: dict,
                 temperature, max_tokens)
 
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-    try:
-        parsed = json.loads(clean)
-        return {
-            "reasoning": parsed.get("reasoning", ""),
-            "label":     normalize_label(parsed.get("label", "")),
-        }
-    except json.JSONDecodeError:
-        # Try extracting label field
-        lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
-        rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
-        label = normalize_label(lm.group(1)) if lm else _fallback_label(clean)
-        return {
-            "reasoning": rm.group(1) if rm else clean,
-            "label":     label,
-        }
+
+    # Extract VERDICT: line early — used as fallback if JSON is truncated
+    verdict_match = re.search(r"^VERDICT\s*:\s*(.+)$", clean, re.IGNORECASE | re.MULTILINE)
+    verdict_label = normalize_label(verdict_match.group(1).strip()) if verdict_match else ""
+
+    # Find JSON object in the output (may appear after the VERDICT line + reasoning)
+    json_match = re.search(r"\{[\s\S]*\}", clean)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            return {
+                "reasoning": parsed.get("reasoning", ""),
+                "label":     normalize_label(parsed.get("label", "")),
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # JSON absent or malformed — try inline regex, then fall back to VERDICT line
+    lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
+    rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
+    label = (normalize_label(lm.group(1)) if lm
+             else verdict_label if verdict_label
+             else _fallback_label(clean))
+    return {
+        "reasoning": rm.group(1) if rm else clean,
+        "label":     label,
+    }
 
 
 def _fallback_label(text: str) -> str:
@@ -501,8 +587,8 @@ def main():
                         help="Sampling temperature (default: 0.0)")
     parser.add_argument("--max-tokens-step1", type=int, default=1024,
                         help="Max tokens for Step 1 (default: 1024)")
-    parser.add_argument("--max-tokens-step3", type=int, default=512,
-                        help="Max tokens for Step 3 (default: 512)")
+    parser.add_argument("--max-tokens-step3", type=int, default=1024,
+                        help="Max tokens for Step 3 (default: 1024)")
     parser.add_argument("--delay",      type=float, default=2.0,
                         help="Seconds between samples (default: 2.0)")
     parser.add_argument("--output",     default="",
