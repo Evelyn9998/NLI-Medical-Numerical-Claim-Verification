@@ -1,15 +1,21 @@
 """
-CoT + External Calculator Pipeline
-===================================
-Step 1 (CoT, free-form): LLM reasons freely → identifies formula + extracts parameters.
-Step 2 (External Calculator): Pre-written Python function computes exact result (no LLM math).
-Step 3 (Verdict): LLM compares computed result vs claim → TRUE / FALSE / PARTIALLY TRUE.
+CoT + Classifier + External Calculator Pipeline
+================================================
+Step 0 (Classifier):  FormulaClassifier predicts calculator name from the claim text.
+Step 1 (CoT):         LLM reasons freely → identifies formula + extracts parameters.
+Step 2 (External):    Pre-written Python calculator computes exact result (no LLM math).
+Step 3 (Verdict):     Structured JSON reasoning → label derived by Logical Reasoner.
+                      FACT_1 = all input entities correct
+                      FACT_2 = computed result matches claim
+                      FACT_1+FACT_2=true → "true"
+                      FACT_1=true, FACT_2=false → "partially true"
+                      FACT_1=false → "false"
 
 Usage:
-    python baseline_test/cot_external_calc.py --data data/train_300.csv
-    python baseline_test/cot_external_calc.py --data data/train_300.csv --samples 20
-    python baseline_test/cot_external_calc.py --data data/train_300.csv --samples 0 --random
-    python baseline_test/cot_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct
+    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv
+    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --samples 20
+    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --samples 0 --random
+    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct
 """
 
 import argparse
@@ -28,10 +34,9 @@ from calculators import run_calculator
 from train_formula_classifier import FormulaClassifier, QTC_VARIANTS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompts
+# Calculator reference list
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Calculator reference list shown to the model
 _CALCULATOR_LIST = """
 ID 2  — Creatinine Clearance (Cockcroft-Gault Equation): age, creatinine, height, sex, weight
 ID 3  — CKD-EPI Equations for Glomerular Filtration Rate: age, creatinine, sex
@@ -90,6 +95,10 @@ ID 68 — Estimated Date of Conception: Last menstrual date
 ID 69 — Estimated Gestational Age: Current Date, Last menstrual date
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompts
+# ─────────────────────────────────────────────────────────────────────────────
+
 STEP1_SYSTEM = f"""You are a clinical data extraction assistant. Your job is to read a medical evidence note and extract the exact parameter values needed for a specific medical calculator.
 
 Available calculators and their required parameters:
@@ -121,67 +130,55 @@ Instructions:
 The JSON must be valid. Do not output anything after the closing </extraction> tag."""
 
 
+# Step 3 system prompt — structured JSON with three explicit fields for logical reasoner
 STEP3_SYSTEM = """You are a medical fact-checking assistant.
 
 You are given:
 - A clinical evidence note
-- A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, <entity_2> is <value_2>, ..., <entity_N> is <value_N>.")
+- A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, ..., <entity_N> is <value_N>.")
 - The calculator name used
 - The EXACT computed value produced by a verified Python calculator function
 
-Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE by following these steps carefully.
+Your task: verify the claim by working through three explicit steps and returning structured JSON.
 
 ---
 
-STEP-BY-STEP VERIFICATION PROCEDURE:
+STEP 1 — Entity verification (all entities EXCEPT the last one):
+For each input entity in the claim:
+  - Compare the claim value against the evidence note.
+  - correct: true  → value matches evidence, OR entity absent from evidence AND claim says "none"/"no".
+  - correct: false → value differs from evidence, OR entity absent from evidence AND claim gives a specific non-zero value.
 
-Step 1 — Entity verification (all entities EXCEPT the last one):
-  The claim lists entities in the form "<name> is <value>". Check each entity except the LAST one:
-  - Compare the claim's value against the evidence note.
-  - If an entity is NOT mentioned in the evidence, and the claim states it is "none" or "no", treat that entity as CORRECT.
-  - If an entity is NOT mentioned in the evidence, and the claim states a non-zero or non-none value, treat that entity as INCORRECT.
-  - An entity that is PARTIALLY CORRECT (some aspects right, some wrong) counts as INCORRECT.
-  - Count: how many entities are CORRECT and how many are INCORRECT (including partially correct ones).
+STEP 2 — Calculation verification (the LAST entity in the claim):
+  Compare the claim's last entity value against the EXACT computed value provided.
+  - Rule-based calculators (scores): must EXACTLY match → correct: true/false.
+  - Equation-based calculators (labs, measurements): must be within 5% → correct: true/false.
+  - Date-based calculators: must EXACTLY match → correct: true/false.
 
-Step 2 — Calculation verification (the last entity in the claim):
-  The last entity in the claim is the computed result for the named calculator. Compare it against the EXACT computed value:
-  - IMPORTANT: The calculator name above tells you exactly which entity to verify. Only compare the entity that represents the output of that specific calculator — ignore any other numeric values in the claim.
-  - Rule-based calculators (scores, classifications): the claim value must EXACTLY match the computed value.
-  - Equation-based calculators (lab tests, physical measurements, dosage conversions): the claim value must be within 5% of the computed value.
-  - Date-based calculators: the claim date must EXACTLY match the computed date.
-
-Step 3 — Assign label (read ALL four definitions carefully before choosing):
-  - "true":           ALL input entities (Step 1) are correct AND the computed result (Step 2) is correct.
-  - "partially true": ALL input entities (Step 1) are correct AND the computed result (Step 2) is WRONG.
-                      Use this when the inputs match evidence perfectly but the final answer is off.
-  - "false":          ONE OR MORE input entities (Step 1) are incorrect, regardless of whether the result is correct or wrong.
-                      Mixed entity case: if SOME entities are correct and OTHERS are incorrect, that still qualifies as "false" — having some correct entities does NOT prevent "false".
-                      Even if the computed result happens to match the claim, input entity errors mean the label is "false".
-
-CRITICAL RULES:
-- "false" requires at least one incorrect input entity. If ALL inputs are correct, you MUST choose "true" or "partially true".
-- Input entity errors always take priority: one or more incorrect entities → "false", no matter what the result is.
-<<<<<<< HEAD
-- Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
+STEP 3 — Label (derived automatically by logical reasoner — still state it explicitly):
+  - "true":           ALL step1 entities correct=true  AND  step2 correct=true
+  - "partially true": ALL step1 entities correct=true  AND  step2 correct=false
+  - "false":          ANY step1 entity correct=false (regardless of step2)
 
 ---
 
-OUTPUT FORMAT:
-1. First line MUST be: VERDICT: <true|false|partially true>
-2. Then show your concise step-by-step reasoning (3-5 sentences, no rule repetition).
-3. Finally output the JSON (no markdown fences):
+Respond ONLY with this exact JSON object (no other text, no markdown fences):
 {
-  "reasoning": "<same concise reasoning>",
-=======
-- You MUST end your response with the JSON object. Be concise in reasoning — for long entity lists, summarize rather than check each one individually.
-
----
-
-Output ONLY this JSON (no markdown fences):
-{
-  "reasoning": "<concise verification: summarize entity correctness, state computed vs claim result, assign label>",
->>>>>>> 8c08abb8f31557a7c5b07182edab3c4e6b0e5509
-  "label": "<true|false|partially true>"
+  "step1_entities": [
+    {
+      "name": "<entity name>",
+      "claim_value": "<value stated in claim>",
+      "evidence_value": "<value found in evidence, or 'not found'>",
+      "correct": true or false
+    }
+  ],
+  "step2_calculation": {
+    "computed_value": "<exact value from verified calculator>",
+    "claimed_value": "<last entity value from claim>",
+    "match_type": "<exact|within_5pct|date_exact>",
+    "correct": true or false
+  },
+  "step3_label": "<true|partially true|false>"
 }"""
 
 
@@ -196,6 +193,79 @@ def normalize_label(label: str) -> str:
     if "partial" in label:         return "partially true"
     return label
 
+
+def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
+    """
+    Detect and truncate Qwen-style repetition loops (e.g. "All rights reserved." repeated).
+    If a phrase of phrase_min_len+ chars repeats threshold+ times, cut before it starts.
+    """
+    pattern = re.compile(
+        r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
+        re.DOTALL
+    )
+    m = pattern.search(text)
+    if m:
+        return text[:m.start()].strip()
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logical Reasoner
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  FACT_1 = all step1_entities have correct=True
+#  FACT_2 = step2_calculation correct=True
+#
+#  FACT_1=True  AND FACT_2=True   →  "true"
+#  FACT_1=True  AND FACT_2=False  →  "partially true"
+#  FACT_1=False (any entity)      →  "false"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _logical_reasoner(parsed: dict) -> str:
+    entities = parsed.get("step1_entities", [])
+    calc     = parsed.get("step2_calculation", {})
+
+    fact1 = bool(entities) and all(bool(e.get("correct", False)) for e in entities)
+    fact2 = bool(calc.get("correct", False))
+
+    if fact1 and fact2:
+        return "true"
+    elif fact1 and not fact2:
+        return "partially true"
+    else:
+        return "false"
+
+
+def _keyword_label(text: str) -> str:
+    """
+    Last-resort label extraction from free text.
+    Priority: partially true > true > false.
+    Defaults to "false" — never returns "unknown".
+    """
+    t = text.lower()
+    if "partially true" in t or "partially_true" in t:
+        return "partially true"
+    if re.search(r'label[":\s]+false', t) or re.search(r'assign.*\bfalse\b', t):
+        return "false"
+    if re.search(r'label[":\s]+true', t) or re.search(r'assign.*\btrue\b', t):
+        return "true"
+    last_false = t.rfind('"false"')
+    last_true  = t.rfind('"true"')
+    if last_false > last_true:
+        return "false"
+    if last_true > last_false:
+        return "true"
+    if "false" in t:
+        return "false"
+    if "true" in t:
+        return "true"
+    return "false"   # safe default — never "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset / model loading
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_dataset(csv_path: str) -> list:
     if not os.path.exists(csv_path):
@@ -268,9 +338,112 @@ def _chat(pipe, _model_name, messages, temperature, max_tokens):
         max_new_tokens=max_tokens,
         temperature=temperature if do_sample else None,
         do_sample=do_sample,
+        repetition_penalty=1.4,       # raised from 1.2 — prevents Qwen looping
         return_full_text=False,
     )
-    return result[0]["generated_text"].strip()
+    raw = result[0]["generated_text"].strip()
+    return _truncate_repetition(raw)   # safety net for any remaining loops
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calculator ID resolver  (classifier name → integer ID)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CALC_NAME_TO_ID: dict = {}
+
+_CALC_ALIASES: dict = {
+    # Wells' DVT (ID 16)
+    "wells' criteria for dvt":                    16,
+    "wells criteria for dvt":                     16,
+    "wells' criteria for deep vein thrombosis":   16,
+    "wells dvt criteria":                         16,
+    "wells dvt score":                            16,
+    "wells dvt":                                  16,
+    # Wells' PE (ID 8)
+    "wells' criteria for pulmonary embolism":     8,
+    "wells criteria for pulmonary embolism":      8,
+    "wells' criteria for pe":                     8,
+    "wells' pe criteria":                         8,
+    "wells pe score":                             8,
+    "wells pe":                                   8,
+    # Maintenance Fluids (ID 22)
+    "maintenance fluids calculations":            22,
+    "maintenance fluids calculation":             22,
+    "maintenance fluid calculations":             22,
+    "holliday-segar":                             22,
+    "holliday segar":                             22,
+    # Centor / McIsaac (ID 20)
+    "centor score (modified/mcisaac)":            20,
+    "centor score":                               20,
+    "modified centor score":                      20,
+    "mcisaac score":                              20,
+    "centor/mcisaac score":                       20,
+    # CCI (ID 32)
+    "charlson comorbidity index":                 32,
+    "cci score":                                  32,
+    "cci":                                        32,
+    # PSI (ID 29)
+    "psi score":                                  29,
+    "pneumonia severity index":                   29,
+    "psi: pneumonia severity index":              29,
+    # HEART (ID 18)
+    "heart score":                                18,
+    # Body Surface Area (ID 60)
+    "body surface area":                          60,
+    "body surface area calculator":               60,
+    "body surface area (mosteller)":              60,
+    "bsa (mosteller)":                            60,
+    "bsa calculator":                             60,
+    # Estimated Date of Conception (ID 68)
+    "estimated date of conception":               68,
+    "estimated of conception":                    68,
+    "estimated conception date":                  68,
+    "date of conception":                         68,
+}
+
+
+def _build_name_to_id() -> dict:
+    mapping: dict = {}
+    for line in _CALCULATOR_LIST.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"ID\s+(\d+)\s+[—–-]+\s+(.+?)(?::|$)", line)
+        if m:
+            mapping[m.group(2).strip().lower()] = int(m.group(1))
+    return mapping
+
+
+def _resolve_calculator_id(calc_name: str) -> int:
+    global _CALC_NAME_TO_ID
+    if not _CALC_NAME_TO_ID:
+        _CALC_NAME_TO_ID = _build_name_to_id()
+
+    key = calc_name.lower().strip()
+
+    if key in _CALC_NAME_TO_ID:
+        return _CALC_NAME_TO_ID[key]
+    if key in _CALC_ALIASES:
+        return _CALC_ALIASES[key]
+    for alias, cid in _CALC_ALIASES.items():
+        if alias in key or key in alias:
+            return cid
+    for name, cid in _CALC_NAME_TO_ID.items():
+        if name in key or key in name:
+            return cid
+
+    key_words = set(re.findall(r'\w{3,}', key))
+    best_cid, best_overlap = 0, 0
+    for name, cid in _CALC_NAME_TO_ID.items():
+        name_words = set(re.findall(r'\w{3,}', name))
+        overlap = len(key_words & name_words)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_cid = cid
+    if best_overlap >= 3:
+        return best_cid
+
+    return 0  # unknown — run_calculator will fail gracefully
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,12 +456,10 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
     Returns {"reasoning": str, "calculator_id": int, "calculator_name": str, "parameters": dict}
     Uses FormulaClassifier to decide which calculator to apply from the claim text.
     """
-    # Use the classifier to predict calculator name from the claim
     predicted_calc_name = classifier.predict(item["claim"])
     calc_id = _resolve_calculator_id(predicted_calc_name)
 
-    hint = (f"The calculator for this case is: "
-            f"ID {calc_id} — {predicted_calc_name}")
+    hint = f"The calculator for this case is: ID {calc_id} — {predicted_calc_name}"
 
     user_msg = (
         f"{hint}\n\n"
@@ -304,24 +475,20 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
                  {"role": "user",   "content": user_msg}],
                 temperature, max_tokens)
 
-    # ── Parse extraction block ────────────────────────────────────────────────
     match = re.search(r"<extraction>([\s\S]*?)</extraction>", raw, re.IGNORECASE)
     json_str = match.group(1).strip() if match else raw
-
-    # Strip markdown fences if present
     json_str = re.sub(r"```(?:json)?|```", "", json_str).strip()
 
     try:
         parsed = json.loads(json_str)
     except json.JSONDecodeError:
-        # Fallback: try to grab the JSON object with regex
         m = re.search(r"\{[\s\S]*\}", json_str)
         try:
             parsed = json.loads(m.group()) if m else {}
         except Exception:
             parsed = {}
 
-    params = parsed.get("parameters", parsed)  # fallback: top-level keys
+    params = parsed.get("parameters", parsed)
 
     return {
         "reasoning":       raw,
@@ -332,118 +499,13 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calculator ID resolver  (classifier name → integer ID)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CALC_NAME_TO_ID: dict = {}
-
-# Explicit aliases for common classifier output names that don't match _CALCULATOR_LIST
-_CALC_ALIASES: dict = {
-    # Wells' DVT (ID 16)
-    "wells' criteria for dvt": 16,
-    "wells criteria for dvt": 16,
-    "wells' criteria for deep vein thrombosis": 16,
-    "wells dvt criteria": 16,
-    "wells dvt score": 16,
-    # Wells' PE (ID 8)
-    "wells' criteria for pulmonary embolism": 8,
-    "wells criteria for pulmonary embolism": 8,
-    "wells' pe criteria": 8,
-    "wells' criteria for pe": 8,
-    "wells pe score": 8,
-    # Maintenance Fluids (ID 22)
-    "maintenance fluids calculations": 22,
-    "maintenance fluids calculation": 22,
-    "maintenance fluid calculations": 22,
-    "holliday-segar": 22,
-    "holliday segar": 22,
-    # Estimated Date of Conception (ID 68)
-    "estimated of conception": 68,
-    "estimated date of conception": 68,
-    "estimated conception date": 68,
-    "date of conception": 68,
-    # Body Surface Area (ID 60)
-    "body surface area calculator": 60,
-    "body surface area (mosteller)": 60,
-    "bsa (mosteller)": 60,
-    "bsa calculator": 60,
-    "body surface area": 60,
-    # PSI (ID 29)
-    "pneumonia severity index": 29,
-    "psi score": 29,
-    "psi: pneumonia severity index": 29,
-    # CCI (ID 32)
-    "charlson comorbidity index": 32,
-    "cci score": 32,
-}
-
-
-def _build_name_to_id() -> dict:
-    """Parse _CALCULATOR_LIST once and return a {lowercased_name: id} dict."""
-    mapping: dict = {}
-    for line in _CALCULATOR_LIST.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"ID\s+(\d+)\s+[—–-]+\s+(.+?)(?::|$)", line)
-        if m:
-            mapping[m.group(2).strip().lower()] = int(m.group(1))
-    return mapping
-
-
-def _resolve_calculator_id(calc_name: str) -> int:
-    """Return the integer calculator ID for a given classifier output name."""
-    global _CALC_NAME_TO_ID
-    if not _CALC_NAME_TO_ID:
-        _CALC_NAME_TO_ID = _build_name_to_id()
-
-    key = calc_name.lower().strip()
-
-    # 1. Exact match in calculator list
-    if key in _CALC_NAME_TO_ID:
-        return _CALC_NAME_TO_ID[key]
-
-    # 2. Exact match in explicit aliases
-    if key in _CALC_ALIASES:
-        return _CALC_ALIASES[key]
-
-    # 3. Partial match in explicit aliases
-    for alias, cid in _CALC_ALIASES.items():
-        if alias in key or key in alias:
-            return cid
-
-    # 4. Substring match in calculator list
-    for name, cid in _CALC_NAME_TO_ID.items():
-        if name in key or key in name:
-            return cid
-
-    # 5. Word-overlap: find list entry with most shared significant words
-    key_words = set(re.findall(r'\w{3,}', key))
-    best_cid, best_overlap = 0, 0
-    for name, cid in _CALC_NAME_TO_ID.items():
-        name_words = set(re.findall(r'\w{3,}', name))
-        overlap = len(key_words & name_words)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_cid = cid
-    if best_overlap >= 3:
-        return best_cid
-
-    return 0  # unknown — run_calculator will fail gracefully
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Verdict
+# Step 3: Verdict — structured JSON → Logical Reasoner
 # ─────────────────────────────────────────────────────────────────────────────
 
 def step3_verdict(client, model, item: dict,
                   computed: dict,
                   temperature: float, max_tokens: int, ev_limit: int) -> dict:
-    """
-    Returns {"reasoning": str, "label": str}
-    """
+    """Returns {"reasoning": str, "label": str}"""
     computed_str = (f"{computed['value']} {computed['unit']}".strip()
                     if computed.get("value") is not None
                     else f"[calculation error: {computed.get('note', 'unknown')}]")
@@ -453,7 +515,7 @@ def step3_verdict(client, model, item: dict,
         f"Claim:\n{item['claim']}\n\n"
         f"Calculator used: {item['calculator_name']}\n"
         f"Computed result (exact, from verified Python function): {computed_str}\n\n"
-        "Verify the claim step by step and output the JSON label."
+        "Respond only with the JSON object."
     )
 
     raw = _chat(client, model,
@@ -463,57 +525,33 @@ def step3_verdict(client, model, item: dict,
 
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
 
-    # Extract VERDICT: line early — used as fallback if JSON is truncated
-    verdict_match = re.search(r"^VERDICT\s*:\s*(.+)$", clean, re.IGNORECASE | re.MULTILINE)
-    verdict_label = normalize_label(verdict_match.group(1).strip()) if verdict_match else ""
+    # ── Primary path: structured JSON → logical reasoner ──────────────────
+    try:
+        parsed = json.loads(clean)
+        label  = _logical_reasoner(parsed)
 
-    # Find JSON object in the output (may appear after the VERDICT line + reasoning)
-    json_match = re.search(r"\{[\s\S]*\}", clean)
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group())
-            return {
-                "reasoning": parsed.get("reasoning", ""),
-                "label":     normalize_label(parsed.get("label", "")),
-            }
-        except json.JSONDecodeError:
-            pass
+        # If step1_entities was empty, fall back to model's step3_label
+        if not parsed.get("step1_entities"):
+            fallback = normalize_label(parsed.get("step3_label", ""))
+            if fallback in ("true", "partially true", "false"):
+                label = fallback
 
-    # JSON absent or malformed — try inline regex, then fall back to VERDICT line
-    lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
-    rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
-    label = (normalize_label(lm.group(1)) if lm
-             else verdict_label if verdict_label
-             else _fallback_label(clean))
-    return {
-        "reasoning": rm.group(1) if rm else clean,
-        "label":     label,
-    }
+        reasoning_out = json.dumps(
+            {
+                "entities":      parsed.get("step1_entities", []),
+                "calculation":   parsed.get("step2_calculation", {}),
+                "derived_label": label,
+            },
+            ensure_ascii=False,
+        )
+        return {"reasoning": reasoning_out, "label": label}
 
-
-def _fallback_label(text: str) -> str:
-    t = text.lower()
-    # Must check "partially true" before "true" to avoid false positive
-    if "partially true" in t or "partially_true" in t:
-        return "partially true"
-    # Look for label assignment patterns before generic word search
-    if re.search(r'label["\s:]+false', t) or re.search(r'assign.*\bfalse\b', t):
-        return "false"
-    if re.search(r'label["\s:]+true', t) or re.search(r'assign.*\btrue\b', t):
-        return "true"
-    # Last resort: find the last occurrence of a label word (model tends to state label at the end)
-    last_false = t.rfind('"false"')
-    last_true  = t.rfind('"true"')
-    if last_false > last_true:
-        return "false"
-    if last_true > last_false:
-        return "true"
-    # Plain word search
-    if "false" in t:
-        return "false"
-    if "true" in t:
-        return "true"
-    return "unknown"
+    # ── Fallback path: JSON failed — scan truncated text for keywords ──────
+    except json.JSONDecodeError:
+        return {
+            "reasoning": clean,
+            "label":     _keyword_label(clean),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -549,7 +587,7 @@ def print_summary(results: list):
     print(f"Accuracy: {correct / n * 100:.1f}%")
 
     from collections import defaultdict
-    by_label = defaultdict(lambda: [0, 0])
+    by_label  = defaultdict(lambda: [0, 0])
     pred_dist = defaultdict(int)
     for r in results:
         by_label[r["true_label"]][1] += 1
@@ -567,7 +605,6 @@ def print_summary(results: list):
     for lbl, cnt in sorted(pred_dist.items(), key=lambda x: -x[1]):
         print(f"  {lbl:<16} {cnt}  ({cnt/n*100:.0f}%)")
 
-    # Step-2 error rate
     calc_errors = sum(1 for r in results if r.get("step2_error"))
     if calc_errors:
         print(f"\nStep-2 calculator errors: {calc_errors}/{n}")
@@ -579,18 +616,15 @@ def print_summary(results: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CoT + External Calculator pipeline for medical NLI"
+        description="CoT + Classifier + External Calculator pipeline for medical NLI"
     )
-    parser.add_argument("--data",       required=True,
-                        help="Path to CSV dataset")
+    parser.add_argument("--data",       required=True,  help="Path to CSV dataset")
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
                         help="HuggingFace model name or local path (default: meta-llama/Llama-3.1-8B-Instruct)")
     parser.add_argument("--samples",    type=int, default=10,
                         help="Number of samples (0 = all)")
-    parser.add_argument("--random",     action="store_true",
-                        help="Randomly sample")
-    parser.add_argument("--start",      type=int, default=1,
-                        help="1-based start index")
+    parser.add_argument("--random",     action="store_true", help="Randomly sample")
+    parser.add_argument("--start",      type=int, default=1, help="1-based start index")
     parser.add_argument("--ev-limit",   type=int, default=3000,
                         help="Max evidence characters (default: 3000)")
     parser.add_argument("--temperature", type=float, default=0.0,
@@ -630,7 +664,7 @@ def main():
 
     # ── Prepare output CSV ────────────────────────────────────────────────
     out_path = args.output or (
-        f"results/cot_calc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        f"results/cot_classifier_calc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
 
@@ -654,7 +688,7 @@ def main():
     for i, item in enumerate(subset, start=args.start):
         print(f"[{i}/{args.start + total - 1}] claim: {item['claim'][:80]}...")
 
-        # ── Step 1: CoT extraction (classifier decides calculator) ────────
+        # ── Step 1: CoT extraction ────────────────────────────────────────
         s1 = _with_retry(
             step1_extract,
             client, model, item, classifier,
@@ -667,7 +701,6 @@ def main():
         print(f"  Classifier → ID {s1['calculator_id']}: {s1['calculator_name']}")
         print(f"  Step 1 params: {list(s1['parameters'].keys())}")
 
-        # Inject classifier-resolved name into item so step3 can reference it
         item_with_calc = {**item,
                           "calculator_name": s1["calculator_name"],
                           "calculator_id":   s1["calculator_id"]}
@@ -677,16 +710,20 @@ def main():
         print(f"  Step 2 computed: {computed['value']} {computed['unit']}"
               + (f"  [!] {computed['note']}" if computed.get("note") else ""))
 
-        # ── Step 3: Verdict ───────────────────────────────────────────────
+        # ── Step 3: Verdict via logical reasoner ──────────────────────────
         s3 = _with_retry(
             step3_verdict,
             client, model, item_with_calc, computed,
             args.temperature, args.max_tokens_step3, args.ev_limit
         )
         if s3 is None:
-            s3 = {"reasoning": "ERROR", "label": "unknown"}
+            s3 = {"reasoning": "ERROR", "label": "false"}   # never "unknown"
 
-        predicted = s3["label"]
+        predicted = normalize_label(s3["label"])
+        # Ensure predicted is always a valid label
+        if predicted not in ("true", "partially true", "false"):
+            predicted = "false"
+
         match = predicted == item["label"]
         print(f"  true={item['label']}  predicted={predicted}  match={match}")
 
@@ -700,8 +737,7 @@ def main():
             "predicted_label":            predicted,
             "match":                      "TRUE" if match else "FALSE",
             "step1_reasoning":            s1["reasoning"].replace("\n", " "),
-            "step1_extracted_params":     json.dumps(s1["parameters"],
-                                                     ensure_ascii=False),
+            "step1_extracted_params":     json.dumps(s1["parameters"], ensure_ascii=False),
             "step2_computed_value":       str(computed.get("value", "")),
             "step2_unit":                 computed.get("unit", ""),
             "step2_error":                computed.get("note", ""),
@@ -711,7 +747,6 @@ def main():
         }
         results.append({**row, "match": match})
 
-        # Write live
         with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writerow(row)

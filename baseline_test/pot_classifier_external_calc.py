@@ -5,7 +5,12 @@ Step 0 (Classifier):  FormulaClassifier predicts calculator name from the claim 
 Step 1 (PoT):         LLM generates Python code to extract parameters from evidence.
                       Code is executed to produce exact parameter values (handles unit conversions).
 Step 2 (External):    Pre-written Python calculator computes exact result (no LLM math).
-Step 3 (Verdict):     LLM compares computed result vs claim → TRUE / FALSE / PARTIALLY TRUE.
+Step 3 (Verdict):     Structured JSON reasoning → label derived by Logical Reasoner.
+                      FACT_1 = all input entities correct
+                      FACT_2 = computed result matches claim
+                      FACT_1+FACT_2=true → "true"
+                      FACT_1=true, FACT_2=false → "partially true"
+                      FACT_1=false → "false"
 
 Usage:
     python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv
@@ -146,46 +151,56 @@ params = {{
 ```"""
 
 
+# Step 3 system prompt — structured JSON with three explicit fields for logical reasoner
 STEP3_SYSTEM = """You are a medical fact-checking assistant.
 
 You are given:
 - A clinical evidence note
-- A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, <entity_2> is <value_2>, ..., <entity_N> is <value_N>.")
+- A claim about a medical calculation (structured as: "Based on the patient's data where <entity_1> is <value_1>, ..., <entity_N> is <value_N>.")
 - The calculator name used
 - The EXACT computed value produced by a verified Python calculator function
 - The relevant entities extracted from the evidence (the ground-truth parameter values)
 
-Your task: decide if the claim is TRUE, FALSE, or PARTIALLY TRUE.
+Your task: verify the claim by working through three explicit steps and returning structured JSON.
 
 ---
 
-VERIFICATION RULES:
+STEP 1 — Entity verification (all entities EXCEPT the last one):
+For each input entity in the claim:
+  - Compare the claim value against the evidence note.
+  - correct: true  → value matches evidence, OR entity absent from evidence AND claim says "none"/"no".
+  - correct: false → value differs from evidence, OR entity absent from evidence AND claim gives a specific non-zero value.
 
-Step 1 — Entity verification (all entities EXCEPT the last one):
-  - Compare each claim entity against the evidence. Count correct vs incorrect.
-  - Entity absent from evidence + claim says "none"/"no" → CORRECT.
-  - Entity absent from evidence + claim gives a non-zero value → INCORRECT.
+STEP 2 — Calculation verification (the LAST entity in the claim):
+  Compare the claim's last entity value against the EXACT computed value provided.
+  - Rule-based calculators (scores): must EXACTLY match → correct: true/false.
+  - Equation-based calculators (labs, measurements): must be within 5% → correct: true/false.
+  - Date-based calculators: must EXACTLY match → correct: true/false.
 
-Step 2 — Calculation verification (the LAST entity in the claim):
-  - Rule-based calculators (scores): claim value must EXACTLY match computed value.
-  - Equation-based calculators (labs, measurements): claim value must be within 5% of computed value.
-  - Date-based calculators: claim date must EXACTLY match computed date.
-
-Step 3 — Label:
-  - "true":           ALL inputs correct AND result correct.
-  - "partially true": ALL inputs correct AND result WRONG.
-  - "false":          ONE OR MORE inputs incorrect AND result WRONG.
-  CRITICAL: "false" requires an input error. Correct inputs → "true" or "partially true" only.
+STEP 3 — Label (derived automatically by logical reasoner — still state it explicitly):
+  - "true":           ALL step1 entities correct=true  AND  step2 correct=true
+  - "partially true": ALL step1 entities correct=true  AND  step2 correct=false
+  - "false":          ANY step1 entity correct=false (regardless of step2)
 
 ---
 
-OUTPUT FORMAT:
-1. First line MUST be: VERDICT: <true|false|partially true>
-2. Then show your concise step-by-step reasoning (3-5 sentences, no rule repetition).
-3. Finally output the JSON (no markdown fences):
+Respond ONLY with this exact JSON object (no other text, no markdown fences):
 {
-  "reasoning": "<same concise reasoning>",
-  "label": "<true|false|partially true>"
+  "step1_entities": [
+    {
+      "name": "<entity name>",
+      "claim_value": "<value stated in claim>",
+      "evidence_value": "<value found in evidence, or 'not found'>",
+      "correct": true or false
+    }
+  ],
+  "step2_calculation": {
+    "computed_value": "<exact value from verified calculator>",
+    "claimed_value": "<last entity value from claim>",
+    "match_type": "<exact|within_5pct|date_exact>",
+    "correct": true or false
+  },
+  "step3_label": "<true|partially true|false>"
 }"""
 
 
@@ -200,6 +215,79 @@ def normalize_label(label: str) -> str:
     if "partial" in label:       return "partially true"
     return label
 
+
+def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
+    """
+    Detect and truncate Qwen-style repetition loops (e.g. "All rights reserved." repeated).
+    If a phrase of phrase_min_len+ chars repeats threshold+ times, cut before it starts.
+    """
+    pattern = re.compile(
+        r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
+        re.DOTALL
+    )
+    m = pattern.search(text)
+    if m:
+        return text[:m.start()].strip()
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logical Reasoner
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  FACT_1 = all step1_entities have correct=True
+#  FACT_2 = step2_calculation correct=True
+#
+#  FACT_1=True  AND FACT_2=True   →  "true"
+#  FACT_1=True  AND FACT_2=False  →  "partially true"
+#  FACT_1=False (any entity)      →  "false"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _logical_reasoner(parsed: dict) -> str:
+    entities = parsed.get("step1_entities", [])
+    calc     = parsed.get("step2_calculation", {})
+
+    fact1 = bool(entities) and all(bool(e.get("correct", False)) for e in entities)
+    fact2 = bool(calc.get("correct", False))
+
+    if fact1 and fact2:
+        return "true"
+    elif fact1 and not fact2:
+        return "partially true"
+    else:
+        return "false"
+
+
+def _keyword_label(text: str) -> str:
+    """
+    Last-resort label extraction from free text.
+    Priority: partially true > true > false.
+    Defaults to "false" — never returns "unknown".
+    """
+    t = text.lower()
+    if "partially true" in t or "partially_true" in t:
+        return "partially true"
+    if re.search(r'label[":\s]+false', t) or re.search(r'assign.*\bfalse\b', t):
+        return "false"
+    if re.search(r'label[":\s]+true', t) or re.search(r'assign.*\btrue\b', t):
+        return "true"
+    last_false = t.rfind('"false"')
+    last_true  = t.rfind('"true"')
+    if last_false > last_true:
+        return "false"
+    if last_true > last_false:
+        return "true"
+    if "false" in t:
+        return "false"
+    if "true" in t:
+        return "true"
+    return "false"   # safe default — never "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset / model loading
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_dataset(csv_path: str) -> list:
     if not os.path.exists(csv_path):
@@ -272,9 +360,11 @@ def _chat(pipe, _model_name, messages, temperature, max_tokens):
         max_new_tokens=max_tokens,
         temperature=temperature if do_sample else None,
         do_sample=do_sample,
+        repetition_penalty=1.4,       # raised from 1.2 — prevents Qwen looping
         return_full_text=False,
     )
-    return result[0]["generated_text"].strip()
+    raw = result[0]["generated_text"].strip()
+    return _truncate_repetition(raw)   # safety net for any remaining loops
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,8 +373,6 @@ def _chat(pipe, _model_name, messages, temperature, max_tokens):
 
 _CALC_NAME_TO_ID: dict = {}
 
-# Explicit aliases for known FormulaClassifier output names that differ from
-# the abbreviated names used in _CALCULATOR_LIST.
 _CLASSIFIER_ALIASES: dict = {
     # Wells' DVT (ID 16)
     "wells' criteria for dvt":                    16,
@@ -336,7 +424,6 @@ _CLASSIFIER_ALIASES: dict = {
     "date of conception":                         68,
 }
 
-# Stop-words to ignore when doing word-overlap matching
 _MATCH_STOP = frozenset({
     'the', 'a', 'an', 'for', 'of', 'and', 'or', 'score', 'index',
     'calculation', 'calculations', 'calculator', 'criteria', 'modified',
@@ -345,7 +432,6 @@ _MATCH_STOP = frozenset({
 
 
 def _build_name_to_id() -> dict:
-    """Parse _CALCULATOR_LIST once and return a {lowercased_name: id} dict."""
     mapping: dict = {}
     for line in _CALCULATOR_LIST.strip().splitlines():
         line = line.strip()
@@ -358,27 +444,20 @@ def _build_name_to_id() -> dict:
 
 
 def _resolve_calculator_id(calc_name: str) -> int:
-    """Return the integer calculator ID for a given classifier output name."""
     global _CALC_NAME_TO_ID
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
 
     key = calc_name.lower().strip()
 
-    # 1. Exact match against parsed list
     if key in _CALC_NAME_TO_ID:
         return _CALC_NAME_TO_ID[key]
-
-    # 2. Explicit alias table (handles FormulaClassifier full-name outputs)
     if key in _CLASSIFIER_ALIASES:
         return _CLASSIFIER_ALIASES[key]
-
-    # 3. Substring match (original logic)
     for name, cid in _CALC_NAME_TO_ID.items():
         if name in key or key in name:
             return cid
 
-    # 4. Word-overlap fallback: pick the list entry with most shared non-stop words
     key_words = set(re.findall(r'[a-z0-9]+', key)) - _MATCH_STOP
     best_id, best_overlap = 0, 0
     for name, cid in _CALC_NAME_TO_ID.items():
@@ -398,7 +477,6 @@ def _resolve_calculator_id(calc_name: str) -> int:
 # Step 1: PoT extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Blocked built-ins for safe exec
 _SAFE_GLOBALS = {"__builtins__": {"round": round, "abs": abs, "int": int,
                                    "float": float, "str": str, "None": None,
                                    "True": True, "False": False, "print": print}}
@@ -411,7 +489,6 @@ def _exec_code(code: str) -> dict:
     params = local_vars.get("params", {})
     if not isinstance(params, dict):
         return {}
-    # Remove None values so calculator knows they are missing
     return {k: v for k, v in params.items() if v is not None}
 
 
@@ -420,15 +497,11 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
     """
     Returns {"code": str, "parameters": dict, "exec_error": str,
              "calculator_id": int, "calculator_name": str}
-    Uses FormulaClassifier to decide which calculator to apply from the claim text,
-    then generates Python code (PoT) to extract parameter values from the evidence.
     """
-    # ── Step 0: classifier resolves calculator from claim ────────────────────
     predicted_calc_name = classifier.predict(item["claim"])
     calc_id = _resolve_calculator_id(predicted_calc_name)
 
-    hint = (f"The calculator for this case is: "
-            f"ID {calc_id} — {predicted_calc_name}")
+    hint = f"The calculator for this case is: ID {calc_id} — {predicted_calc_name}"
 
     user_msg = (
         f"{hint}\n\n"
@@ -445,12 +518,10 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
                  {"role": "user",   "content": user_msg}],
                 temperature, max_tokens)
 
-    # Extract code block (closed fence preferred; fall back to truncated output)
     code_match = re.search(r"```python([\s\S]*?)```", raw, re.IGNORECASE)
     if not code_match:
         code_match = re.search(r"```([\s\S]*?)```", raw)
     if not code_match:
-        # Truncated output: closing ``` was cut off — take everything after the opening fence
         code_match = re.search(r"```python([\s\S]+)", raw, re.IGNORECASE)
     if not code_match:
         code_match = re.search(r"```([\s\S]+)", raw)
@@ -464,7 +535,6 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
             params = _exec_code(code)
         except Exception as e:
             exec_error = f"exec error: {e}"
-            # Try to salvage params via JSON fallback in raw text
             jm = re.search(r"\{[\s\S]*\}", raw)
             if jm:
                 try:
@@ -473,7 +543,6 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
                     pass
     else:
         exec_error = "no code block found"
-        # Try JSON fallback
         jm = re.search(r"\{[\s\S]*\}", raw)
         if jm:
             try:
@@ -492,7 +561,7 @@ def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Verdict
+# Step 3: Verdict — structured JSON → Logical Reasoner
 # ─────────────────────────────────────────────────────────────────────────────
 
 def step3_verdict(client, model, item: dict,
@@ -510,7 +579,7 @@ def step3_verdict(client, model, item: dict,
         f"Calculator used: {item['calculator_name']}\n"
         f"Computed result (exact, from verified Python function): {computed_str}\n"
         + (f"Relevant entities from evidence: {relevant}\n\n" if relevant else "\n")
-        + "Output the JSON verdict now."
+        + "Respond only with the JSON object."
     )
 
     raw = _chat(client, model,
@@ -520,53 +589,33 @@ def step3_verdict(client, model, item: dict,
 
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
 
-    # Extract VERDICT: line early — used as fallback if JSON is truncated
-    verdict_match = re.search(r"^VERDICT\s*:\s*(.+)$", clean, re.IGNORECASE | re.MULTILINE)
-    verdict_label = normalize_label(verdict_match.group(1).strip()) if verdict_match else ""
+    # ── Primary path: structured JSON → logical reasoner ──────────────────
+    try:
+        parsed = json.loads(clean)
+        label  = _logical_reasoner(parsed)
 
-    # Find JSON object in the output (may appear after the VERDICT line + reasoning)
-    json_match = re.search(r"\{[\s\S]*\}", clean)
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group())
-            return {
-                "reasoning": parsed.get("reasoning", ""),
-                "label":     normalize_label(parsed.get("label", "")),
-            }
-        except json.JSONDecodeError:
-            pass
+        # If step1_entities was empty, fall back to model's step3_label
+        if not parsed.get("step1_entities"):
+            fallback = normalize_label(parsed.get("step3_label", ""))
+            if fallback in ("true", "partially true", "false"):
+                label = fallback
 
-    # JSON absent or malformed — try inline regex, then fall back to VERDICT line
-    lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
-    rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
-    label = (normalize_label(lm.group(1)) if lm
-             else verdict_label if verdict_label
-             else _fallback_label(clean))
-    return {
-        "reasoning": rm.group(1) if rm else clean,
-        "label":     label,
-    }
+        reasoning_out = json.dumps(
+            {
+                "entities":      parsed.get("step1_entities", []),
+                "calculation":   parsed.get("step2_calculation", {}),
+                "derived_label": label,
+            },
+            ensure_ascii=False,
+        )
+        return {"reasoning": reasoning_out, "label": label}
 
-
-def _fallback_label(text: str) -> str:
-    t = text.lower()
-    if "partially true" in t or "partially_true" in t:
-        return "partially true"
-    if re.search(r'label["\s:]+false', t) or re.search(r'assign.*\bfalse\b', t):
-        return "false"
-    if re.search(r'label["\s:]+true', t) or re.search(r'assign.*\btrue\b', t):
-        return "true"
-    last_false = t.rfind('"false"')
-    last_true  = t.rfind('"true"')
-    if last_false > last_true:
-        return "false"
-    if last_true > last_false:
-        return "true"
-    if "false" in t:
-        return "false"
-    if "true" in t:
-        return "true"
-    return "unknown"
+    # ── Fallback path: JSON failed — scan truncated text for keywords ──────
+    except json.JSONDecodeError:
+        return {
+            "reasoning": clean,
+            "label":     _keyword_label(clean),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -636,16 +685,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="PoT + Classifier + External Calculator pipeline for medical NLI"
     )
-    parser.add_argument("--data",       required=True,
-                        help="Path to CSV dataset")
+    parser.add_argument("--data",       required=True,  help="Path to CSV dataset")
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
                         help="HuggingFace model name or local path")
     parser.add_argument("--samples",    type=int, default=10,
                         help="Number of samples (0 = all)")
-    parser.add_argument("--random",     action="store_true",
-                        help="Randomly sample")
-    parser.add_argument("--start",      type=int, default=1,
-                        help="1-based start index")
+    parser.add_argument("--random",     action="store_true", help="Randomly sample")
+    parser.add_argument("--start",      type=int, default=1, help="1-based start index")
     parser.add_argument("--ev-limit",   type=int, default=3000,
                         help="Max evidence characters (default: 3000)")
     parser.add_argument("--temperature", type=float, default=0.0,
@@ -709,7 +755,7 @@ def main():
     for i, item in enumerate(subset, start=args.start):
         print(f"[{i}/{args.start + total - 1}] claim: {item['claim'][:80]}...")
 
-        # ── Step 1: PoT extraction (classifier decides calculator) ────────
+        # ── Step 1: PoT extraction ────────────────────────────────────────
         s1 = _with_retry(
             step1_extract,
             client, model, item, classifier,
@@ -724,7 +770,6 @@ def main():
             print(f"  Step 1 exec error: {s1['exec_error']}")
         print(f"  Step 1 params: {list(s1['parameters'].keys())}")
 
-        # Inject classifier-resolved name into item so step3 can reference it
         item_with_calc = {**item,
                           "calculator_name": s1["calculator_name"],
                           "calculator_id":   s1["calculator_id"]}
@@ -734,16 +779,20 @@ def main():
         print(f"  Step 2 computed: {computed['value']} {computed['unit']}"
               + (f"  [!] {computed['note']}" if computed.get("note") else ""))
 
-        # ── Step 3: Verdict ───────────────────────────────────────────────
+        # ── Step 3: Verdict via logical reasoner ──────────────────────────
         s3 = _with_retry(
             step3_verdict,
             client, model, item_with_calc, computed,
             args.temperature, args.max_tokens_step3, args.ev_limit
         )
         if s3 is None:
-            s3 = {"reasoning": "ERROR", "label": "unknown"}
+            s3 = {"reasoning": "ERROR", "label": "false"}   # never "unknown"
 
-        predicted = s3["label"]
+        predicted = normalize_label(s3["label"])
+        # Ensure predicted is always a valid label
+        if predicted not in ("true", "partially true", "false"):
+            predicted = "false"
+
         match = predicted == item["label"]
         print(f"  true={item['label']}  predicted={predicted}  match={match}")
 
