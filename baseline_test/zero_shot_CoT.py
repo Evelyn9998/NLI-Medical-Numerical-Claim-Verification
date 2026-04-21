@@ -1,7 +1,7 @@
 """
 LLM Fact-Check Evaluator
-Uses Llama-3.1-8B-Instruct via local HuggingFace model.
-Zero-shot Direct Prompting: Evidence + Claim -> Label prediction with CoT.
+Uses Llama-3.1-8B-Instruct or Qwen via local HuggingFace model.
+Zero-shot Direct Prompting: Evidence + Claim -> Structured reasoning -> Label via Logical Reasoner.
 
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
@@ -11,7 +11,7 @@ Install dependencies:
 
 Usage:
     python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct"
-    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 20 --random
+    python evaluate.py --data "train_300.csv" --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
     python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
 """
 
@@ -19,14 +19,14 @@ import argparse
 import csv
 import json
 import os
-import random
 import re
+import random
 import sys
 import time
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompt — structured JSON output with three explicit steps
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a clinical claim that involves numerical entities and a medical calculation, determine whether the claim is TRUE, PARTIALLY TRUE, or FALSE.
@@ -38,39 +38,48 @@ The claim contains a list of entities (input values extracted from the patient r
 STEP 1 — Check each input entity (all entities EXCEPT the last one):
 For every input entity mentioned in the claim:
 a) Look for that entity in the evidence.
-   - If the entity is NOT present in the evidence AND the claim states its value as "none" or "no", treat it as CORRECT.
-   - If the entity is NOT present in the evidence AND the claim states a specific numeric value, treat it as INCORRECT → the overall label is FALSE.
-b) If the entity IS present in the evidence, compare the claim value with the evidence value and note whether they match.
+   - If the entity is NOT present in the evidence AND the claim states its value as "none" or "no", treat it as correct (correct: true).
+   - If the entity is NOT present in the evidence AND the claim states a specific numeric value, treat it as incorrect (correct: false).
+b) If the entity IS present in the evidence, compare the claim value with the evidence value and set correct accordingly.
 
 STEP 2 — Perform the medical calculation step by step:
 a) State the formula used.
-b) Substitute each input value from the evidence (not from the claim) into the formula.
+b) Substitute each input value FROM THE EVIDENCE (not from the claim) into the formula.
 c) Show every arithmetic step and arrive at the correct computed result.
 d) Compare the correct computed result with the value stated in the claim's last entity.
+e) Set "correct": true if the result matches (rule-based: exact match; equation-based: within 5%; date-based: exact match), otherwise false.
 
-STEP 3 — Assign the label using these definitions:
-
-- "true": ALL input entities (all except the last) are correct AND the final calculation result is correct.
-  Correctness criteria for the calculation result:
-  • Rule-based calculators (e.g., scoring systems with discrete categories): the claimed answer must exactly match the ground-truth answer.
-  • Equation-based calculators (lab tests, physical measurements, dosage conversions): the claimed answer must be within 5% of the correct computed answer.
-  • Date-based equations: the claimed date must exactly match the correct date.
-
-- "partially true": ALL input entities (all except the last) are correct, BUT the final calculation result in the claim is incorrect (i.e., it deviates from the correct value). Note: the last entity (the computed result) is NOT used to judge whether entities are correct — only the preceding input entities are checked for "partially true".
-
-- "false": One or more input entities (all except the last) are incorrect AND the final calculation result is also incorrect.
+STEP 3 — Assign the label using these rules:
+- "true"          : ALL step1 entities have correct=true  AND  step2 calculation correct=true
+- "partially true": ALL step1 entities have correct=true  AND  step2 calculation correct=false
+- "false"         : ANY step1 entity has correct=false (regardless of calculation)
 
 ---
 
 IMPORTANT RULES:
-- An entity not found in the evidence is treated as INCORRECT unless the claim explicitly states its value as "none" or "no".
-- Always use the evidence values (not the claim's input values) when performing your calculation in Step 2.
-- Show the full formula and every arithmetic step before assigning the label.
+- An entity not found in the evidence is incorrect (correct: false) UNLESS the claim explicitly states its value as "none" or "no".
+- Always use EVIDENCE values (not claim input values) when performing your calculation in Step 2.
+- Show the full formula and every arithmetic step before deciding step2 correct.
 
-Respond in this exact JSON format (no other text, no markdown fences):
+Respond ONLY with this exact JSON object (no other text, no markdown fences):
 {
-  "reasoning": "<Step 1: entity-by-entity check | Step 2: formula, full calculation, result vs. claim | Step 3: label with justification>",
-  "label": "<true|partially true|false>"
+  "step1_entities": [
+    {
+      "name": "<entity name>",
+      "claim_value": "<value stated in claim>",
+      "evidence_value": "<value found in evidence, or 'not found'>",
+      "correct": true or false
+    }
+  ],
+  "step2_calculation": {
+    "formula": "<formula name and expression>",
+    "substitution": "<formula with evidence values plugged in>",
+    "steps": "<every arithmetic step shown>",
+    "correct_result": "<computed answer>",
+    "claimed_result": "<last entity value from claim>",
+    "correct": true or false
+  },
+  "step3_label": "<true|partially true|false>"
 }"""
 
 # ---------------------------------------------------------------------------
@@ -86,6 +95,55 @@ def normalize_label(label: str) -> str:
     if "partial" in label:
         return "partially true"
     return label
+
+
+def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
+    """
+    If any substring of phrase_min_len+ chars repeats threshold+ times consecutively,
+    truncate the text just before the repetition starts. Handles Qwen looping issues.
+    """
+    pattern = re.compile(
+        r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
+        re.DOTALL
+    )
+    m = pattern.search(text)
+    if m:
+        return text[:m.start()].strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Logical Reasoner
+# ---------------------------------------------------------------------------
+#
+#  Implements the label logic from the picture:
+#
+#    FACT_1 = all step1_entities are correct
+#    FACT_2 = step2_calculation is correct
+#
+#    FACT_1=True  AND FACT_2=True   →  "true"
+#    FACT_1=True  AND FACT_2=False  →  "partially true"
+#    FACT_1=False (any)             →  "false"   (FACT_2 irrelevant)
+#
+# ---------------------------------------------------------------------------
+
+def _logical_reasoner(parsed: dict) -> str:
+    entities = parsed.get("step1_entities", [])
+    calc     = parsed.get("step2_calculation", {})
+
+    # FACT_1: every input entity must be correct
+    fact1 = bool(entities) and all(
+        bool(e.get("correct", False)) for e in entities
+    )
+    # FACT_2: calculation result must be correct
+    fact2 = bool(calc.get("correct", False))
+
+    if fact1 and fact2:
+        return "true"
+    elif fact1 and not fact2:
+        return "partially true"
+    else:
+        return "false"
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +223,8 @@ def load_model(model_name: str):
 
 def call_model(model, evidence: str, claim: str, ev_limit: int,
                temperature: float, max_tokens: int) -> dict:
-    pipe, model_name = model
+    pipe, _ = model
+
     user_msg = (
         f"Evidence:\n{evidence[:ev_limit]}\n\n"
         f"Claim:\n{claim}\n\n"
@@ -179,36 +238,60 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
         max_new_tokens=max_tokens,
         temperature=temperature if do_sample else None,
         do_sample=do_sample,
-        repetition_penalty=1.2,
+        repetition_penalty=1.4,       # raised from 1.2 — Qwen needs higher value
         return_full_text=False,
     )
-    raw_text = result[0]["generated_text"].strip()
-    clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
 
+    raw_text = result[0]["generated_text"].strip()
+    raw_text = _truncate_repetition(raw_text)             # fix Qwen looping
+    clean    = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+
+    # ── Primary path: structured JSON → logical reasoner ──────────────────
     try:
         parsed = json.loads(clean)
-        return {
-            "reasoning": parsed.get("reasoning", ""),
-            "label":     parsed.get("label", ""),
-        }
+        label  = _logical_reasoner(parsed)
+
+        # If step1_entities was empty (model skipped it), fall back to
+        # model's own step3_label rather than always returning "false"
+        if not parsed.get("step1_entities"):
+            fallback = normalize_label(parsed.get("step3_label", ""))
+            if fallback in ("true", "partially true", "false"):
+                label = fallback
+
+        reasoning_out = json.dumps(
+            {
+                "entities":    parsed.get("step1_entities", []),
+                "calculation": parsed.get("step2_calculation", {}),
+                "derived_label": label,
+            },
+            ensure_ascii=False,
+            indent=None,
+        )
+        return {"reasoning": reasoning_out, "label": label}
+
+    # ── Fallback path: JSON parse failed — scan truncated text for keywords ─
     except json.JSONDecodeError:
-        lm = re.search(r'"label"\s*:\s*"([^"]+)"', clean, re.IGNORECASE)
-        rm = re.search(r'"reasoning"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean, re.IGNORECASE)
         return {
-            "reasoning": rm.group(1) if rm else clean,
-            "label":     lm.group(1) if lm else _fallback_label(clean),
+            "reasoning": clean,
+            "label":     _keyword_label(clean),
         }
 
 
-def _fallback_label(text: str) -> str:
+def _keyword_label(text: str) -> str:
+    """
+    Last-resort label extraction from free text.
+    Priority: partially true > true > false.
+    Defaults to "false" (never returns "unknown").
+    """
     t = text.lower()
     if "partially true" in t or "partially_true" in t:
         return "partially true"
-    if '"true"' in t or re.search(r"\blabel\b.*\btrue\b", t):
+    if '"true"' in t or re.search(r'\blabel\b.*\btrue\b', t):
         return "true"
-    if '"false"' in t or re.search(r"\blabel\b.*\bfalse\b", t):
+    if '"false"' in t or re.search(r'\blabel\b.*\bfalse\b', t):
         return "false"
-    return "unknown"
+    # Safe default — malformed output almost always signals a genuinely wrong claim
+    return "false"
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +373,11 @@ def print_summary(results: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Llama-3.1-8B Groq API evaluator — Zero-shot Fact-Check with CoT"
+        description="HuggingFace evaluator — Zero-shot Fact-Check with Structured CoT + Logical Reasoner"
     )
     parser.add_argument(
         "--data", required=True,
-        help="Path to CSV dataset, e.g. train_200.csv"
+        help="Path to CSV dataset, e.g. train_300.csv"
     )
     parser.add_argument(
         "--model", default="meta-llama/Llama-3.1-8B-Instruct",
@@ -343,29 +426,36 @@ def main():
         print(f"Randomly selected {n} samples")
     else:
         start_idx = args.start - 1
-        subset = all_data[start_idx:start_idx + n] if args.samples != 0 else all_data[start_idx:]
+        subset = (
+            all_data[start_idx:start_idx + n]
+            if args.samples != 0
+            else all_data[start_idx:]
+        )
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
-    # Load model (Groq API client)
+    # Load model
     model = load_model(args.model)
 
-    # Prepare output file (write header immediately)
+    # Prepare output file (write header immediately so results stream live)
     out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    fieldnames = ["index", "evidence", "claim", "true_label", "predicted_label",
-                  "match", "model_reasoning", "dataset_explanation"]
+    fieldnames = [
+        "index", "evidence", "claim", "true_label", "predicted_label",
+        "match", "model_reasoning", "dataset_explanation",
+    ]
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     print(f"Writing results live to: {out_path}\n")
 
     # Evaluation loop
     results = []
-    n = len(subset)
-    print(f"Starting evaluation ({n} samples)...\n")
+    total   = len(subset)
+    print(f"Starting evaluation ({total} samples)...\n")
 
     for i, item in enumerate(subset, start=args.start):
-        print(f"[{i}/{args.start + n - 1}] Running inference...")
-        predicted = "unknown"
+        print(f"[{i}/{args.start + total - 1}] Running inference...")
+        predicted = "false"   # safe default — never "unknown"
         reasoning = ""
+
         for attempt in range(3):
             try:
                 resp = call_model(
@@ -378,7 +468,8 @@ def main():
                 )
                 predicted = normalize_label(resp["label"])
                 reasoning = resp["reasoning"]
-                if predicted != "unknown" or attempt == 2:
+                # Accept on first valid label
+                if predicted in ("true", "partially true", "false"):
                     break
             except Exception as e:
                 print(f"  [attempt {attempt+1}/3] Error: {e}")
@@ -388,6 +479,7 @@ def main():
                     time.sleep(wait)
                 else:
                     reasoning = f"Error: {e}"
+                    predicted = "false"
 
         match = predicted == item["label"]
         row = {
@@ -402,7 +494,7 @@ def main():
         }
         results.append(row)
 
-        # Append this row to CSV immediately
+        # Append to CSV immediately (live streaming)
         with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writerow({
@@ -417,12 +509,11 @@ def main():
             })
 
         print(f"  true={item['label']}  predicted={predicted}  match={match}")
-        if i < args.start + n - 1:
+        if i < args.start + total - 1:
             time.sleep(args.delay)
 
-    # Summary
     print_summary(results)
-    print(f"Results saved to: {out_path}")
+    print(f"\nResults saved to: {out_path}")
 
 
 if __name__ == "__main__":
