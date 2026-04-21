@@ -1,26 +1,27 @@
 """
-LLM Fact-Check Evaluator
-Uses Llama-3.1-8B-Instruct or Qwen via local HuggingFace model.
-Zero-shot Direct Prompting: Evidence + Claim -> Structured reasoning -> Label via Logical Reasoner.
+LLM Fact-Check Evaluator — OpenAI GPT version
+Uses OpenAI API (gpt-4o-mini by default) for zero-shot CoT fact-checking.
+Structured JSON output with three explicit steps + Logical Reasoner.
 
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
 
 Install dependencies:
-    pip install transformers torch
+    pip install openai
 
 Usage:
-    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct"
-    python evaluate.py --data "train_300.csv" --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
-    python evaluate.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
+    export OPENAI_API_KEY=sk-...
+    python baseline_test/zs_CoT_gpt.py --data mrt_claim_full.csv --model gpt-4o-mini --samples 2
+    python baseline_test/zs_CoT_gpt.py --data mrt_claim_full.csv --samples 20 --random
+    python baseline_test/zs_CoT_gpt.py --data mrt_claim_full.csv --samples 0
 """
 
 import argparse
 import csv
 import json
 import os
-import re
 import random
+import re
 import sys
 import time
 from datetime import datetime
@@ -99,33 +100,16 @@ def normalize_label(label: str) -> str:
     return label
 
 
-def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
-    """
-    If any substring of phrase_min_len+ chars repeats threshold+ times consecutively,
-    truncate the text just before the repetition starts. Handles Qwen looping issues.
-    """
-    pattern = re.compile(
-        r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
-        re.DOTALL
-    )
-    m = pattern.search(text)
-    if m:
-        return text[:m.start()].strip()
-    return text
-
-
 # ---------------------------------------------------------------------------
 # Logical Reasoner
 # ---------------------------------------------------------------------------
 #
-#  Implements the label logic from the picture:
+#  FACT_1 = all step1_entities are correct
+#  FACT_2 = step2_calculation is correct
 #
-#    FACT_1 = all step1_entities are correct
-#    FACT_2 = step2_calculation is correct
-#
-#    FACT_1=True  AND FACT_2=True   →  "true"
-#    FACT_1=True  AND FACT_2=False  →  "partially true"
-#    FACT_1=False (any)             →  "false"   (FACT_2 irrelevant)
+#  FACT_1=True  AND FACT_2=True   →  "true"
+#  FACT_1=True  AND FACT_2=False  →  "partially true"
+#  FACT_1=False (any)             →  "false"   (FACT_2 irrelevant)
 #
 # ---------------------------------------------------------------------------
 
@@ -133,11 +117,9 @@ def _logical_reasoner(parsed: dict) -> str:
     entities = parsed.get("step1_entities", [])
     calc     = parsed.get("step2_calculation", {})
 
-    # FACT_1: every input entity must be correct
     fact1 = bool(entities) and all(
         bool(e.get("correct", False)) for e in entities
     )
-    # FACT_2: calculation result must be correct
     fact2 = bool(calc.get("correct", False))
 
     if fact1 and fact2:
@@ -176,47 +158,16 @@ def load_dataset(csv_path: str) -> list:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str):
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+def load_model(args):
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("Error: OPENAI_API_KEY environment variable is not set.")
+        sys.exit(1)
 
-    print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    has_gpu = torch.cuda.is_available()
-    print(f"  GPU available: {has_gpu}")
-
-    if has_gpu:
-        try:
-            from transformers import BitsAndBytesConfig
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-            )
-            print("  4-bit quantization enabled (bitsandbytes)")
-        except Exception as e:
-            print(f"  bitsandbytes not available ({e}), loading in fp16")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-            )
-    else:
-        print("  No GPU, loading on CPU (fp32)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float32,
-            device_map="cpu",
-        )
-
-    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
-    print(f"Model ready: {model_name}")
-    return pipe, model_name
+    from openai import OpenAI
+    client = OpenAI()
+    print(f"OpenAI client initialised. Model: {args.model}")
+    return (client, args.model)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +176,7 @@ def load_model(model_name: str):
 
 def call_model(model, evidence: str, claim: str, ev_limit: int,
                temperature: float, max_tokens: int) -> dict:
-    pipe, _ = model
+    client, model_name = model
 
     user_msg = (
         f"Evidence:\n{evidence[:ev_limit]}\n\n"
@@ -233,20 +184,32 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
         "Respond only with the JSON object."
     )
 
-    do_sample = temperature > 0.0
-    result = pipe(
-        [{"role": "system", "content": SYSTEM_PROMPT},
-         {"role": "user",   "content": user_msg}],
-        max_new_tokens=max_tokens,
-        temperature=temperature if do_sample else None,
-        do_sample=do_sample,
-        repetition_penalty=1.4,       # raised from 1.2 — Qwen needs higher value
-        return_full_text=False,
-    )
+    from openai import RateLimitError
 
-    raw_text = result[0]["generated_text"].strip()
-    raw_text = _truncate_repetition(raw_text)             # fix Qwen looping
-    clean    = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+    last_exc = None
+    raw_text = ""
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+            )
+            raw_text = response.choices[0].message.content.strip()
+            break
+        except RateLimitError as e:
+            last_exc = e
+            wait = 2 ** attempt * 5  # 5s, 10s, 20s
+            print(f"  [attempt {attempt+1}/3] RateLimitError — waiting {wait}s...")
+            time.sleep(wait)
+    else:
+        raise last_exc
+
+    clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
 
     # ── Primary path: structured JSON → logical reasoner ──────────────────
     try:
@@ -262,8 +225,8 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
 
         reasoning_out = json.dumps(
             {
-                "entities":    parsed.get("step1_entities", []),
-                "calculation": parsed.get("step2_calculation", {}),
+                "entities":     parsed.get("step1_entities", []),
+                "calculation":  parsed.get("step2_calculation", {}),
                 "derived_label": label,
             },
             ensure_ascii=False,
@@ -271,7 +234,7 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
         )
         return {"reasoning": reasoning_out, "label": label}
 
-    # ── Fallback path: JSON parse failed — scan truncated text for keywords ─
+    # ── Fallback path: JSON parse failed — scan text for keywords ─────────
     except json.JSONDecodeError:
         return {
             "reasoning": clean,
@@ -280,11 +243,7 @@ def call_model(model, evidence: str, claim: str, ev_limit: int,
 
 
 def _keyword_label(text: str) -> str:
-    """
-    Last-resort label extraction from free text.
-    Priority: partially true > true > false.
-    Defaults to "false" (never returns "unknown").
-    """
+    """Last-resort label extraction from free text. Defaults to 'false'."""
     t = text.lower()
     if "partially true" in t or "partially_true" in t:
         return "partially true"
@@ -292,45 +251,7 @@ def _keyword_label(text: str) -> str:
         return "true"
     if '"false"' in t or re.search(r'\blabel\b.*\bfalse\b', t):
         return "false"
-    # Safe default — malformed output almost always signals a genuinely wrong claim
     return "false"
-
-
-# ---------------------------------------------------------------------------
-# Save results to CSV
-# ---------------------------------------------------------------------------
-
-def save_results(results: list, output_path: str):
-    if not results:
-        return
-
-    fieldnames = [
-        "index",
-        "evidence",
-        "claim",
-        "true_label",
-        "predicted_label",
-        "match",
-        "model_reasoning",
-        "dataset_explanation",
-    ]
-
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow({
-                "index":               r["index"],
-                "evidence":            r["evidence"],
-                "claim":               r["claim"],
-                "true_label":          r["true_label"],
-                "predicted_label":     r["predicted"],
-                "match":               "TRUE" if r["match"] else "FALSE",
-                "model_reasoning":     r["reasoning"].replace("\n", " "),
-                "dataset_explanation": r["explanation"].replace("\n", " "),
-            })
-
-    print(f"Results saved to: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -375,15 +296,15 @@ def print_summary(results: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HuggingFace evaluator — Zero-shot Fact-Check with Structured CoT + Logical Reasoner"
+        description="OpenAI GPT evaluator — Zero-shot Fact-Check with Structured CoT + Logical Reasoner"
     )
     parser.add_argument(
         "--data", required=True,
-        help="Path to CSV dataset, e.g. train_300.csv"
+        help="Path to CSV dataset, e.g. mrt_claim_full.csv"
     )
     parser.add_argument(
-        "--model", default="meta-llama/Llama-3.1-8B-Instruct",
-        help="HuggingFace model name or local path (default: meta-llama/Llama-3.1-8B-Instruct)"
+        "--model", default="gpt-4o-mini",
+        help="OpenAI model name (default: gpt-4o-mini)"
     )
     parser.add_argument(
         "--samples", type=int, default=10,
@@ -435,8 +356,8 @@ def main():
         )
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
-    # Load model
-    model = load_model(args.model)
+    # Load model (OpenAI client)
+    model = load_model(args)
 
     # Prepare output file (write header immediately so results stream live)
     out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -455,7 +376,7 @@ def main():
 
     for i, item in enumerate(subset, start=args.start):
         print(f"[{i}/{args.start + total - 1}] Running inference...")
-        predicted = "false"   # safe default — never "unknown"
+        predicted = "false"
         reasoning = ""
 
         for attempt in range(3):
@@ -470,7 +391,6 @@ def main():
                 )
                 predicted = normalize_label(resp["label"])
                 reasoning = resp["reasoning"]
-                # Accept on first valid label
                 if predicted in ("true", "partially true", "false"):
                     break
             except Exception as e:
