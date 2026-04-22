@@ -1,27 +1,26 @@
 """
-CoT + Classifier + External Calculator Pipeline
-================================================
+CoT + Classifier + External Calculator Pipeline — OpenAI API version
+=====================================================================
 Step 0 (Classifier):  FormulaClassifier predicts calculator name from the claim text.
 Step 1 (CoT):         LLM reasons freely → identifies formula + extracts parameters.
 Step 2 (External):    Pre-written Python calculator computes exact result (no LLM math).
 Step 3 (Verdict):     Structured JSON reasoning → label derived by Logical Reasoner.
-                      FACT_1 = all input entities correct
-                      FACT_2 = computed result matches claim
-                      FACT_1+FACT_2=true → "true"
-                      FACT_1=true, FACT_2=false → "partially true"
-                      FACT_1=false → "false"
 
-Batching strategy:
-  Step 1 and Step 3 are the two LLM calls per sample.
-  Step 2 is a deterministic Python calculator (CPU, fast).
-  We batch Step 1 across all samples in the batch simultaneously, then run
-  Step 2 for each, then batch Step 3 — keeping the GPU fed at every stage.
+Concurrency strategy:
+  Step 1 and Step 3 are LLM calls — dispatched concurrently via ThreadPoolExecutor.
+  Step 2 is a deterministic Python calculator (CPU, fast, sequential).
+  All samples in a batch have their Step 1 calls in-flight simultaneously,
+  then Step 2 runs sequentially (negligible time), then Step 3 calls are
+  dispatched simultaneously — matching the GPU batching approach exactly.
+
+Install dependencies:
+    pip install openai
 
 Usage:
-    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv
-    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --samples 20
-    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --samples 0 --random
-    python baseline_test/cot_classifier_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct --batch-size 4
+    export OPENAI_API_KEY="sk-..."
+    python cot_classifier_external_calc_openai.py --data data/train_300.csv
+    python cot_classifier_external_calc_openai.py --data data/train_300.csv --model gpt-4o-mini --samples 20
+    python cot_classifier_external_calc_openai.py --data data/train_300.csv --samples 0 --max-workers 16
 """
 
 import argparse
@@ -32,15 +31,15 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-# Add project root to path so we can import calculators
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from calculators import run_calculator
 from train_formula_classifier import FormulaClassifier, QTC_VARIANTS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calculator reference list
+# Calculator reference list — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CALCULATOR_LIST = """
@@ -102,7 +101,7 @@ ID 69 — Estimated Gestational Age: Current Date, Last menstrual date
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompts
+# Prompts — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 STEP1_SYSTEM = f"""You are a clinical data extraction assistant. Your job is to read a medical evidence note and extract the exact parameter values needed for a specific medical calculator.
@@ -188,14 +187,14 @@ Respond ONLY with this exact JSON object (no other text, no markdown fences):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_label(label: str) -> str:
     label = (label or "").lower().strip()
-    if label == "true":            return "true"
-    if label == "false":           return "false"
-    if "partial" in label:         return "partially true"
+    if label == "true":         return "true"
+    if label == "false":        return "false"
+    if "partial" in label:      return "partially true"
     return label
 
 
@@ -211,31 +210,23 @@ def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3
 
 
 def _clean_raw(raw: str) -> str:
-    """Strip think tags, repetitions, and markdown fences from model output."""
     raw = _truncate_repetition(raw)
     raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
     return raw
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Logical Reasoner
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _logical_reasoner(parsed: dict) -> str:
     entities = parsed.get("step1_entities", [])
     calc     = parsed.get("step2_calculation", {})
     fact1 = bool(entities) and all(bool(e.get("correct", False)) for e in entities)
     fact2 = bool(calc.get("correct", False))
-    if fact1 and fact2:      return "true"
+    if fact1 and fact2:       return "true"
     elif fact1 and not fact2: return "partially true"
-    else:                    return "false"
+    else:                     return "false"
 
 
 def _keyword_label(text: str) -> str:
-    """
-    Last-resort label extraction. Never returns "unknown".
-    WARNING: bare substring matches are a final safety net only.
-    """
+    """Last-resort label extraction. Never returns "unknown"."""
     t = text.lower()
     if "partially true" in t or "partially_true" in t:
         return "partially true"
@@ -253,7 +244,7 @@ def _keyword_label(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset / model loading
+# Dataset loading — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_dataset(csv_path: str) -> list:
@@ -277,67 +268,28 @@ def load_dataset(csv_path: str) -> list:
     return rows
 
 
-def load_model(model_name: str, batch_size: int) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading — OpenAI client
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_model(model_name: str, max_workers: int) -> dict:
     """
-    Returns {"pipeline": pipe, "model_name": model_name}.
-    low_cpu_mem_usage=True loads weights directly to GPU, cutting load time ~30-50%.
-    batch_size is baked into the pipeline for continuous GPU utilisation.
+    Returns {"client": OpenAI(), "model_name": str, "max_workers": int}.
+    No GPU, no quantization, no batch_size.
+    Concurrency is handled by ThreadPoolExecutor in _run_api_batch.
     """
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-
-    print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    has_gpu = torch.cuda.is_available()
-    print(f"  GPU available: {has_gpu}")
-
-    if has_gpu:
-        try:
-            from transformers import BitsAndBytesConfig
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-            print("  4-bit quantization enabled (bitsandbytes)")
-        except Exception as e:
-            print(f"  bitsandbytes not available ({e}), loading in fp16")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=torch.float16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-    else:
-        print("  No GPU, loading on CPU (fp32)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.float32,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-    )
-    print(f"Model ready: {model_name}  (batch_size={batch_size})")
-    return {"pipeline": pipe, "model_name": model_name}
+    from openai import OpenAI
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("Error: OPENAI_API_KEY environment variable is not set.")
+        sys.exit(1)
+    client = OpenAI(api_key=api_key)
+    print(f"Using OpenAI model: {model_name}  (max_workers={max_workers})")
+    return {"client": client, "model_name": model_name, "max_workers": max_workers}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calculator ID resolver
+# Calculator ID resolver — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CALC_NAME_TO_ID: dict = {}
@@ -385,8 +337,8 @@ def _resolve_calculator_id(calc_name: str) -> int:
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
     key = calc_name.lower().strip()
-    if key in _CALC_NAME_TO_ID:      return _CALC_NAME_TO_ID[key]
-    if key in _CALC_ALIASES:         return _CALC_ALIASES[key]
+    if key in _CALC_NAME_TO_ID:    return _CALC_NAME_TO_ID[key]
+    if key in _CALC_ALIASES:       return _CALC_ALIASES[key]
     for alias, cid in _CALC_ALIASES.items():
         if alias in key or key in alias:
             return cid
@@ -406,53 +358,56 @@ def _resolve_calculator_id(calc_name: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-level batched pipeline call
+# Low-level concurrent API call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_pipeline_batch(model: dict, all_messages: list, temperature: float,
-                        max_tokens: int, repetition_penalty: float) -> list:
+def _call_api_one(client, model_name: str, messages: list,
+                  temperature: float, max_tokens: int, idx: int) -> tuple:
+    """Call the API for a single sample with retry. Returns (idx, raw_text)."""
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return idx, response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"  [API attempt {attempt+1}/3] Error: {e}")
+            if attempt < 2:
+                time.sleep(30 * (attempt + 1))
+    return idx, ""
+
+
+def _run_api_batch(model: dict, all_messages: list,
+                   temperature: float, max_tokens: int) -> list:
     """
-    Send a list of message-lists to the pipeline in one call.
-    Returns a list of raw text strings (one per input).
-    Falls back to one-by-one on error.
+    Dispatch all messages concurrently to the OpenAI API.
+    Returns list of cleaned raw strings in the same order as all_messages.
     """
-    pipe      = model["pipeline"]
-    do_sample = temperature > 0.0
-    gen_kwargs = dict(
-        max_new_tokens=max_tokens,
-        temperature=temperature if do_sample else None,
-        do_sample=do_sample,
-        repetition_penalty=repetition_penalty if do_sample else 1.0,
-        return_full_text=False,
-        pad_token_id=pipe.tokenizer.pad_token_id,
-    )
-    try:
-        outputs = pipe(all_messages, **gen_kwargs)
-        return [_clean_raw(o[0]["generated_text"].strip()) for o in outputs]
-    except Exception as e:
-        print(f"  Batch pipeline error ({e}), falling back to one-by-one...")
-        results = []
-        for msgs in all_messages:
-            for attempt in range(3):
-                try:
-                    out = pipe(msgs, **gen_kwargs)
-                    results.append(_clean_raw(out[0]["generated_text"].strip()))
-                    break
-                except Exception as e2:
-                    if attempt < 2:
-                        time.sleep(30 * (attempt + 1))
-                    else:
-                        results.append("")
-        return results
+    client      = model["client"]
+    model_name  = model["model_name"]
+    max_workers = model["max_workers"]
+
+    raw_results = [None] * len(all_messages)
+    with ThreadPoolExecutor(max_workers=min(len(all_messages), max_workers)) as executor:
+        futures = {
+            executor.submit(_call_api_one, client, model_name, msgs,
+                            temperature, max_tokens, i): i
+            for i, msgs in enumerate(all_messages)
+        }
+        for future in as_completed(futures):
+            idx, text = future.result()
+            raw_results[idx] = _clean_raw(text)
+    return raw_results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: batched CoT extraction
+# Step 1: concurrent CoT extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_step1_messages(item: dict, classifier: "FormulaClassifier",
-                          ev_limit: int) -> tuple:
-    """Returns (messages, calc_id, calc_name) for one item."""
+def _build_step1_messages(item: dict, classifier, ev_limit: int) -> tuple:
     calc_name = classifier.predict(item["claim"])
     calc_id   = _resolve_calculator_id(calc_name)
     hint      = f"The calculator for this case is: ID {calc_id} — {calc_name}"
@@ -488,24 +443,22 @@ def _parse_step1(raw: str, calc_id: int, calc_name: str) -> dict:
     }
 
 
-def run_step1_batch(model: dict, batch: list, classifier: "FormulaClassifier",
-                    ev_limit: int, temperature: float, max_tokens: int,
-                    repetition_penalty: float) -> list:
-    """Run Step 1 for all items in the batch simultaneously."""
+def run_step1_batch(model: dict, batch: list, classifier,
+                    ev_limit: int, temperature: float,
+                    max_tokens: int) -> list:
     all_msgs, calc_ids, calc_names = [], [], []
     for item in batch:
         msgs, cid, cname = _build_step1_messages(item, classifier, ev_limit)
         all_msgs.append(msgs)
         calc_ids.append(cid)
         calc_names.append(cname)
-
-    raws = _run_pipeline_batch(model, all_msgs, temperature, max_tokens, repetition_penalty)
-    return [_parse_step1(raw, cid, cname)
+    raws = _run_api_batch(model, all_msgs, temperature, max_tokens)
+    return [_parse_step1(raw or "", cid, cname)
             for raw, cid, cname in zip(raws, calc_ids, calc_names)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: batched verdict
+# Step 3: concurrent verdict
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_step3_messages(item: dict, computed: dict, ev_limit: int) -> list:
@@ -533,8 +486,8 @@ def _parse_step3(raw: str) -> dict:
             if fallback in ("true", "partially true", "false"):
                 label = fallback
         reasoning_out = json.dumps(
-            {"entities": parsed.get("step1_entities", []),
-             "calculation": parsed.get("step2_calculation", {}),
+            {"entities":     parsed.get("step1_entities", []),
+             "calculation":  parsed.get("step2_calculation", {}),
              "derived_label": label},
             ensure_ascii=False,
         )
@@ -544,17 +497,15 @@ def _parse_step3(raw: str) -> dict:
 
 
 def run_step3_batch(model: dict, items_with_calc: list, computed_list: list,
-                    ev_limit: int, temperature: float, max_tokens: int,
-                    repetition_penalty: float) -> list:
-    """Run Step 3 for all items in the batch simultaneously."""
+                    ev_limit: int, temperature: float, max_tokens: int) -> list:
     all_msgs = [_build_step3_messages(item, computed, ev_limit)
                 for item, computed in zip(items_with_calc, computed_list)]
-    raws = _run_pipeline_batch(model, all_msgs, temperature, max_tokens, repetition_penalty)
-    return [_parse_step3(raw) for raw in raws]
+    raws = _run_api_batch(model, all_msgs, temperature, max_tokens)
+    return [_parse_step3(raw or "") for raw in raws]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Summary
+# Summary — identical to local version
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_summary(results: list):
@@ -567,7 +518,6 @@ def print_summary(results: list):
     print(f"Correct : {correct}")
     print(f"Wrong   : {n - correct}")
     print(f"Accuracy: {correct / n * 100:.1f}%")
-
     from collections import defaultdict
     by_label  = defaultdict(lambda: [0, 0])
     pred_dist = defaultdict(int)
@@ -576,17 +526,14 @@ def print_summary(results: list):
         if r["match"]:
             by_label[r["true_label"]][0] += 1
         pred_dist[r["predicted_label"]] += 1
-
     print("\nAccuracy by true label:")
     for lbl in ["true", "false", "partially true"]:
         c, t = by_label[lbl]
         if t:
             print(f"  {lbl:<16} {c}/{t}  ({c/t*100:.0f}%)")
-
     print("\nPrediction distribution:")
     for lbl, cnt in sorted(pred_dist.items(), key=lambda x: -x[1]):
         print(f"  {lbl:<16} {cnt}  ({cnt/n*100:.0f}%)")
-
     calc_errors = sum(1 for r in results if r.get("step2_error"))
     if calc_errors:
         print(f"\nStep-2 calculator errors: {calc_errors}/{n}")
@@ -598,11 +545,11 @@ def print_summary(results: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CoT + Classifier + External Calculator pipeline for medical NLI"
+        description="CoT + Classifier + External Calculator pipeline — OpenAI API version"
     )
     parser.add_argument("--data",       required=True,  help="Path to CSV dataset")
-    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
-                        help="HuggingFace model name or local path")
+    parser.add_argument("--model",      default="gpt-4o-mini",
+                        help="OpenAI model name (default: gpt-4o-mini)")
     parser.add_argument("--samples",    type=int, default=10,
                         help="Number of samples (0 = all)")
     parser.add_argument("--random",     action="store_true", help="Randomly sample")
@@ -611,14 +558,14 @@ def main():
                         help="Max evidence characters (default: 3000)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (default: 0.0)")
-    parser.add_argument("--repetition-penalty", type=float, default=1.4,
-                        help="Repetition penalty when temperature > 0 (default: 1.4)")
     parser.add_argument("--max-tokens-step1", type=int, default=2048,
                         help="Max tokens for Step 1 (default: 2048)")
     parser.add_argument("--max-tokens-step3", type=int, default=1024,
                         help="Max tokens for Step 3 (default: 1024)")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Samples per GPU batch (default: 4; reduce if OOM)")
+    parser.add_argument("--max-workers", type=int, default=8,
+                        help="Concurrent API requests (default: 8; reduce to 4 if 429 errors)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Samples dispatched per round (default: 16)")
     parser.add_argument("--delay",      type=float, default=0.0,
                         help="Seconds between batches (default: 0.0)")
     parser.add_argument("--output",     default="",
@@ -630,7 +577,6 @@ def main():
     if args.random and args.start != 1:
         print(f"Warning: --start {args.start} is ignored when --random is set.")
 
-    # ── Load data ──────────────────────────────────────────────────────────
     all_data = load_dataset(args.data)
     n = len(all_data) if args.samples == 0 else min(args.samples, len(all_data))
 
@@ -642,14 +588,12 @@ def main():
         subset = all_data[s:s + n] if args.samples != 0 else all_data[s:]
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
-    # ── Load classifier + model ───────────────────────────────────────────
     print(f"Loading formula classifier from: {args.classifier}")
     classifier = FormulaClassifier(args.classifier)
     print("Formula classifier ready.\n")
 
-    model = load_model(args.model, args.batch_size)
+    model = load_model(args.model, args.max_workers)
 
-    # ── Prepare output CSV ────────────────────────────────────────────────
     out_path = args.output or (
         f"results/cot_classifier_calc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
@@ -666,10 +610,10 @@ def main():
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     print(f"Writing results live to: {out_path}\n")
 
-    # ── Batched evaluation loop ───────────────────────────────────────────
     results = []
     total   = len(subset)
-    print(f"Starting evaluation ({total} samples, batch_size={args.batch_size})...\n")
+    print(f"Starting evaluation ({total} samples, "
+          f"batch_size={args.batch_size}, max_workers={args.max_workers})...\n")
 
     for batch_start in range(0, total, args.batch_size):
         batch      = subset[batch_start : batch_start + args.batch_size]
@@ -677,38 +621,32 @@ def main():
                                 args.start + batch_start + len(batch)))
 
         print(f"[{batch_idxs[0]}–{batch_idxs[-1]}/{args.start + total - 1}] "
-              f"Batch of {len(batch)} — Step 1 (CoT extraction)...")
+              f"Step 1 — {len(batch)} concurrent API calls...")
 
-        # ── Step 1: batch all extractions ────────────────────────────────
         s1_list = run_step1_batch(
             model, batch, classifier,
-            args.ev_limit, args.temperature,
-            args.max_tokens_step1, args.repetition_penalty,
+            args.ev_limit, args.temperature, args.max_tokens_step1,
         )
 
-        # ── Step 2: calculator (CPU, sequential — fast) ───────────────────
-        computed_list    = []
-        items_with_calc  = []
+        computed_list   = []
+        items_with_calc = []
         for item, s1 in zip(batch, s1_list):
             computed = run_calculator(s1["calculator_id"], s1["parameters"])
             computed_list.append(computed)
             items_with_calc.append({**item,
                                     "calculator_name": s1["calculator_name"],
                                     "calculator_id":   s1["calculator_id"]})
-            print(f"  [{batch_idxs[batch.index(item)]}] "
-                  f"Classifier→ID {s1['calculator_id']}: {s1['calculator_name']}  "
+            idx = batch_idxs[batch.index(item)]
+            print(f"  [{idx}] Classifier→ID {s1['calculator_id']}: {s1['calculator_name']}  "
                   f"computed={computed['value']} {computed['unit']}"
                   + (f"  [!] {computed['note']}" if computed.get("note") else ""))
 
-        # ── Step 3: batch all verdicts ────────────────────────────────────
-        print(f"  Step 3 (verdict) for batch...")
+        print(f"  Step 3 — {len(batch)} concurrent API calls...")
         s3_list = run_step3_batch(
             model, items_with_calc, computed_list,
-            args.ev_limit, args.temperature,
-            args.max_tokens_step3, args.repetition_penalty,
+            args.ev_limit, args.temperature, args.max_tokens_step3,
         )
 
-        # ── Write results ─────────────────────────────────────────────────
         with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             for item, idx, s1, computed, s3 in zip(
@@ -716,10 +654,8 @@ def main():
                 predicted = normalize_label(s3["label"])
                 if predicted not in ("true", "partially true", "false"):
                     predicted = "false"
-
                 match = predicted == item["label"]
                 print(f"  [{idx}] true={item['label']}  predicted={predicted}  match={match}")
-
                 row = {
                     "index":                      idx,
                     "classifier_calculator_id":   s1["calculator_id"],

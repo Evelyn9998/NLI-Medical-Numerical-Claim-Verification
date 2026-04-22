@@ -1,19 +1,20 @@
 """
-LLM Fact-Check Evaluator
-Uses Llama-3.1-8B-Instruct or Qwen via local HuggingFace model.
+LLM Fact-Check Evaluator — OpenAI API version
+Uses any OpenAI chat model (default: gpt-4o-mini).
 Zero-shot Direct Prompting: Evidence + Claim -> Structured reasoning -> Label via Logical Reasoner.
 
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
 
 Install dependencies:
-    pip install transformers torch
+    pip install openai
 
 Usage:
-    python zero_shot_CoT.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct"
-    python zero_shot_CoT.py --data "train_300.csv" --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
-    python zero_shot_CoT.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
-    python zero_shot_CoT.py --data "train_300.csv" --model "$HOME/models/Llama-3.1-8B-Instruct" --batch-size 4
+    export OPENAI_API_KEY="sk-..."
+    python zero_shot_CoT_openai.py --data "train_300.csv"
+    python zero_shot_CoT_openai.py --data "train_300.csv" --model "gpt-4o-mini" --samples 20 --random
+    python zero_shot_CoT_openai.py --data "train_300.csv" --model "gpt-4o" --samples 0
+    python zero_shot_CoT_openai.py --data "train_300.csv" --max-workers 16
 """
 
 import argparse
@@ -24,10 +25,11 @@ import re
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# System prompt — structured JSON output with three explicit steps
+# System prompt — identical to the local version
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a clinical claim that involves numerical entities and a medical calculation, determine whether the claim is TRUE, PARTIALLY TRUE, or FALSE.
@@ -86,25 +88,18 @@ Respond ONLY with this exact JSON object (no other text, no markdown fences):
 }"""
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — identical to local version
 # ---------------------------------------------------------------------------
 
 def normalize_label(label: str) -> str:
     label = (label or "").lower().strip()
-    if label == "true":
-        return "true"
-    if label == "false":
-        return "false"
-    if "partial" in label:
-        return "partially true"
+    if label == "true":       return "true"
+    if label == "false":      return "false"
+    if "partial" in label:    return "partially true"
     return label
 
 
 def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
-    """
-    If any substring of phrase_min_len+ chars repeats threshold+ times consecutively,
-    truncate the text just before the repetition starts. Handles Qwen looping issues.
-    """
     pattern = re.compile(
         r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
         re.DOTALL
@@ -115,45 +110,70 @@ def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3
     return text
 
 
-# ---------------------------------------------------------------------------
-# Logical Reasoner
-# ---------------------------------------------------------------------------
-#
-#  FACT_1 = all step1_entities are correct
-#  FACT_2 = step2_calculation is correct
-#
-#  FACT_1=True  AND FACT_2=True   →  "true"
-#  FACT_1=True  AND FACT_2=False  →  "partially true"
-#  FACT_1=False (any)             →  "false"   (FACT_2 irrelevant)
-#
-# ---------------------------------------------------------------------------
-
 def _logical_reasoner(parsed: dict) -> str:
     entities = parsed.get("step1_entities", [])
     calc     = parsed.get("step2_calculation", {})
-
-    fact1 = bool(entities) and all(
-        bool(e.get("correct", False)) for e in entities
-    )
+    fact1 = bool(entities) and all(bool(e.get("correct", False)) for e in entities)
     fact2 = bool(calc.get("correct", False))
+    if fact1 and fact2:       return "true"
+    elif fact1 and not fact2: return "partially true"
+    else:                     return "false"
 
-    if fact1 and fact2:
-        return "true"
-    elif fact1 and not fact2:
+
+def _keyword_label(text: str) -> str:
+    """
+    Last-resort label extraction from free text.
+    Priority: partially true > false > true.
+    Defaults to "false" (never returns "unknown").
+    WARNING: bare substring matches are a final safety net only.
+    """
+    t = text.lower()
+    if "partially true" in t or "partially_true" in t:
         return "partially true"
-    else:
+    if re.search(r'label[":\s]+false', t) or re.search(r'assign.*\bfalse\b', t):
         return "false"
+    if re.search(r'label[":\s]+true', t) or re.search(r'assign.*\btrue\b', t):
+        return "true"
+    last_false = t.rfind('"false"')
+    last_true  = t.rfind('"true"')
+    if last_false > last_true:  return "false"
+    if last_true > last_false:  return "true"
+    if "false" in t:            return "false"
+    if "true" in t:             return "true"
+    return "false"
+
+
+def _parse_response(raw_text: str) -> dict:
+    """Convert raw model text into {"reasoning": str, "label": str}."""
+    raw_text = _truncate_repetition(raw_text)
+    raw_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text, flags=re.IGNORECASE).strip()
+    clean    = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+    try:
+        parsed = json.loads(clean)
+        label  = _logical_reasoner(parsed)
+        if not parsed.get("step1_entities"):
+            fallback = normalize_label(parsed.get("step3_label", ""))
+            if fallback in ("true", "partially true", "false"):
+                label = fallback
+        reasoning_out = json.dumps(
+            {"entities":    parsed.get("step1_entities", []),
+             "calculation": parsed.get("step2_calculation", {}),
+             "derived_label": label},
+            ensure_ascii=False, indent=None,
+        )
+        return {"reasoning": reasoning_out, "label": label}
+    except json.JSONDecodeError:
+        return {"reasoning": clean, "label": _keyword_label(clean)}
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset loading — identical to local version
 # ---------------------------------------------------------------------------
 
 def load_dataset(csv_path: str) -> list:
     if not os.path.exists(csv_path):
         print(f"Error: file not found: {csv_path}")
         sys.exit(1)
-
     rows = []
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -170,139 +190,30 @@ def load_dataset(csv_path: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Model loading — OpenAI client instead of HuggingFace pipeline
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str, batch_size: int) -> dict:
+def load_model(model_name: str, max_workers: int) -> dict:
     """
-    Returns {"pipeline": pipe, "model_name": model_name}.
-    batch_size is baked into the pipeline so the GPU stays fed continuously.
-    low_cpu_mem_usage=True loads weights directly to GPU layer-by-layer,
-    cutting model load time by ~30-50% vs the default full-CPU-then-move path.
+    Returns {"client": OpenAI(), "model_name": str, "max_workers": int}.
+    No GPU, no quantization. Concurrency is handled by ThreadPoolExecutor
+    in run_batch — the API processes requests on OpenAI's infrastructure.
     """
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-
-    print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-
-    # Padding token required for batched inference — use eos_token if absent
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    has_gpu = torch.cuda.is_available()
-    print(f"  GPU available: {has_gpu}")
-
-    if has_gpu:
-        try:
-            from transformers import BitsAndBytesConfig
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                low_cpu_mem_usage=True,   # load directly to GPU, skip full CPU pass
-            )
-            print("  4-bit quantization enabled (bitsandbytes)")
-        except Exception as e:
-            print(f"  bitsandbytes not available ({e}), loading in fp16")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=torch.float16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-    else:
-        print("  No GPU, loading on CPU (fp32)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.float32,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=batch_size,   # GPU processes batch_size samples in parallel
-    )
-    print(f"Model ready: {model_name}  (batch_size={batch_size})")
-    return {"pipeline": pipe, "model_name": model_name}
+    from openai import OpenAI
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("Error: OPENAI_API_KEY environment variable is not set.")
+        sys.exit(1)
+    client = OpenAI(api_key=api_key)
+    print(f"Using OpenAI model: {model_name}  (max_workers={max_workers})")
+    return {"client": client, "model_name": model_name, "max_workers": max_workers}
 
 
 # ---------------------------------------------------------------------------
-# Single-response post-processing (shared between batch and retry paths)
-# ---------------------------------------------------------------------------
-
-def _parse_response(raw_text: str) -> dict:
-    """Convert raw model text into {"reasoning": str, "label": str}."""
-    raw_text = _truncate_repetition(raw_text)
-    raw_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text, flags=re.IGNORECASE).strip()
-    clean    = re.sub(r"```(?:json)?|```", "", raw_text).strip()
-
-    try:
-        parsed = json.loads(clean)
-        label  = _logical_reasoner(parsed)
-
-        if not parsed.get("step1_entities"):
-            fallback = normalize_label(parsed.get("step3_label", ""))
-            if fallback in ("true", "partially true", "false"):
-                label = fallback
-
-        reasoning_out = json.dumps(
-            {
-                "entities":      parsed.get("step1_entities", []),
-                "calculation":   parsed.get("step2_calculation", {}),
-                "derived_label": label,
-            },
-            ensure_ascii=False,
-            indent=None,
-        )
-        return {"reasoning": reasoning_out, "label": label}
-
-    except json.JSONDecodeError:
-        return {"reasoning": clean, "label": _keyword_label(clean)}
-
-
-def _keyword_label(text: str) -> str:
-    """
-    Last-resort label extraction from free text.
-    Priority: partially true > false > true.
-    Defaults to "false" (never returns "unknown").
-
-    WARNING: bare substring matches are intentionally last — they fire on any
-    occurrence of the word, including negations. Final safety net only.
-    """
-    t = text.lower()
-    if "partially true" in t or "partially_true" in t:
-        return "partially true"
-    if re.search(r'label[":\s]+false', t) or re.search(r'assign.*\bfalse\b', t):
-        return "false"
-    if re.search(r'label[":\s]+true', t) or re.search(r'assign.*\btrue\b', t):
-        return "true"
-    last_false = t.rfind('"false"')
-    last_true  = t.rfind('"true"')
-    if last_false > last_true:
-        return "false"
-    if last_true > last_false:
-        return "true"
-    if "false" in t:
-        return "false"
-    if "true" in t:
-        return "true"
-    return "false"
-
-
-# ---------------------------------------------------------------------------
-# Batched inference
+# Inference — concurrent API calls replace GPU batching
 # ---------------------------------------------------------------------------
 
 def _build_messages(item: dict, ev_limit: int) -> list:
-    """Build the chat message list for one sample."""
     user_msg = (
         f"Evidence:\n{item['evidence'][:ev_limit]}\n\n"
         f"Claim:\n{item['claim']}\n\n"
@@ -314,45 +225,63 @@ def _build_messages(item: dict, ev_limit: int) -> list:
     ]
 
 
+def _call_api_one(client, model_name: str, messages: list,
+                  temperature: float, max_tokens: int,
+                  idx: int) -> tuple:
+    """Call the API for a single sample with retry. Returns (idx, raw_text)."""
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return idx, response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"  [API attempt {attempt+1}/3] Error: {e}")
+            if attempt < 2:
+                time.sleep(30 * (attempt + 1))
+    return idx, ""
+
+
 def run_batch(model: dict, batch: list, ev_limit: int,
               temperature: float, max_tokens: int,
               repetition_penalty: float) -> list:
     """
-    Run inference on a list of items in one pipeline call.
-    Returns a list of {"reasoning": str, "label": str} dicts, one per item.
-    The pipeline pads inputs to the longest sequence in the batch and processes
-    them in parallel on the GPU, keeping utilisation high between samples.
+    Send all items in the batch to the OpenAI API concurrently.
+    max_workers controls how many requests are in-flight simultaneously.
+    repetition_penalty is ignored (not supported by OpenAI API).
+    Results are returned in the same order as the input batch.
     """
-    pipe     = model["pipeline"]
-    do_sample = temperature > 0.0
+    client      = model["client"]
+    model_name  = model["model_name"]
+    max_workers = model["max_workers"]
 
     all_messages = [_build_messages(item, ev_limit) for item in batch]
+    raw_results  = [None] * len(batch)
 
-    results = pipe(
-        all_messages,
-        max_new_tokens=max_tokens,
-        temperature=temperature if do_sample else None,
-        do_sample=do_sample,
-        repetition_penalty=repetition_penalty if do_sample else 1.0,
-        return_full_text=False,
-        # Pad to longest in batch; pipeline handles this automatically when
-        # pad_token_id is set (done in load_model via tokenizer.pad_token).
-        pad_token_id=pipe.tokenizer.pad_token_id,
-    )
+    with ThreadPoolExecutor(max_workers=min(len(batch), max_workers)) as executor:
+        futures = {
+            executor.submit(_call_api_one, client, model_name, msgs,
+                            temperature, max_tokens, i): i
+            for i, msgs in enumerate(all_messages)
+        }
+        for future in as_completed(futures):
+            idx, text = future.result()
+            raw_results[idx] = text
 
-    # pipeline returns List[List[dict]] when given a list of inputs
-    return [_parse_response(r[0]["generated_text"].strip()) for r in results]
+    return [_parse_response(r or "") for r in raw_results]
 
 
 # ---------------------------------------------------------------------------
-# Summary
+# Summary — identical to local version
 # ---------------------------------------------------------------------------
 
 def print_summary(results: list):
     n = len(results)
     if n == 0:
         return
-
     correct = sum(1 for r in results if r["match"])
     print(f"\n=== Summary ===")
     print(f"Total   : {n}")
@@ -386,12 +315,12 @@ def print_summary(results: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HuggingFace evaluator — Zero-shot Fact-Check with Structured CoT + Logical Reasoner"
+        description="OpenAI evaluator — Zero-shot Fact-Check with Structured CoT + Logical Reasoner"
     )
     parser.add_argument("--data", required=True,
-                        help="Path to CSV dataset, e.g. train_300.csv")
-    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
-                        help="HuggingFace model name or local path")
+                        help="Path to CSV dataset")
+    parser.add_argument("--model", default="gpt-4o-mini",
+                        help="OpenAI model name (default: gpt-4o-mini)")
     parser.add_argument("--samples", type=int, default=10,
                         help="Number of samples to test (default: 10; set 0 for all)")
     parser.add_argument("--random", action="store_true",
@@ -399,17 +328,19 @@ def main():
     parser.add_argument("--ev-limit", type=int, default=2000,
                         help="Max characters of Evidence passed to model (default: 2000)")
     parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature (default: 0.0 for greedy/deterministic decoding)")
-    parser.add_argument("--repetition-penalty", type=float, default=1.4,
-                        help="Repetition penalty applied only when temperature > 0 (default: 1.4)")
+                        help="Sampling temperature (default: 0.0)")
     parser.add_argument("--max-tokens", type=int, default=2048,
-                        help="Max output tokens per inference (default: 2048)")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Samples per GPU batch (default: 4; reduce if OOM, increase if VRAM allows)")
+                        help="Max output tokens per call (default: 2048)")
+    parser.add_argument("--max-workers", type=int, default=8,
+                        help="Concurrent API requests per batch (default: 8; "
+                             "reduce to 4 if you hit 429 rate-limit errors)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Samples dispatched concurrently (default: 16)")
     parser.add_argument("--start", type=int, default=1,
                         help="1-based index to start from (default: 1)")
     parser.add_argument("--delay", type=float, default=0.0,
-                        help="Seconds to sleep between batches (default: 0.0)")
+                        help="Seconds to sleep between batches (default: 0.0; "
+                             "increase if hitting rate limits)")
     parser.add_argument("--output", default="",
                         help="Output CSV path (default: auto-generated with timestamp)")
     args = parser.parse_args()
@@ -429,8 +360,8 @@ def main():
         subset = all_data[start_idx:start_idx + n] if args.samples != 0 else all_data[start_idx:]
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
-    # ── Load model ────────────────────────────────────────────────────────
-    model = load_model(args.model, args.batch_size)
+    # ── Load model (OpenAI client) ────────────────────────────────────────
+    model = load_model(args.model, args.max_workers)
 
     # ── Prepare output CSV ────────────────────────────────────────────────
     out_path = args.output or f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -442,10 +373,11 @@ def main():
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     print(f"Writing results live to: {out_path}\n")
 
-    # ── Batched evaluation loop ───────────────────────────────────────────
+    # ── Batched (concurrent) evaluation loop ──────────────────────────────
     results = []
     total   = len(subset)
-    print(f"Starting evaluation ({total} samples, batch_size={args.batch_size})...\n")
+    print(f"Starting evaluation ({total} samples, "
+          f"batch_size={args.batch_size}, max_workers={args.max_workers})...\n")
 
     for batch_start in range(0, total, args.batch_size):
         batch      = subset[batch_start : batch_start + args.batch_size]
@@ -453,41 +385,14 @@ def main():
                                 args.start + batch_start + len(batch)))
 
         print(f"[{batch_idxs[0]}–{batch_idxs[-1]}/{args.start + total - 1}] "
-              f"Running batch of {len(batch)}...")
+              f"Dispatching {len(batch)} concurrent API calls...")
 
-        # --- Attempt the whole batch; fall back to per-sample on failure ---
-        try:
-            resps = run_batch(
-                model, batch, args.ev_limit,
-                args.temperature, args.max_tokens, args.repetition_penalty,
-            )
-        except Exception as e:
-            print(f"  Batch error ({e}), falling back to one-by-one...")
-            resps = []
-            for item in batch:
-                for attempt in range(3):
-                    try:
-                        msgs = _build_messages(item, args.ev_limit)
-                        pipe = model["pipeline"]
-                        do_sample = args.temperature > 0.0
-                        raw = pipe(
-                            msgs,
-                            max_new_tokens=args.max_tokens,
-                            temperature=args.temperature if do_sample else None,
-                            do_sample=do_sample,
-                            repetition_penalty=args.repetition_penalty if do_sample else 1.0,
-                            return_full_text=False,
-                        )[0]["generated_text"].strip()
-                        resps.append(_parse_response(raw))
-                        break
-                    except Exception as e2:
-                        print(f"    [attempt {attempt+1}/3] Error: {e2}")
-                        if attempt < 2:
-                            time.sleep(30 * (attempt + 1))
-                        else:
-                            resps.append({"reasoning": f"Error: {e2}", "label": "false"})
+        resps = run_batch(
+            model, batch, args.ev_limit,
+            args.temperature, args.max_tokens,
+            repetition_penalty=1.0,   # unused by OpenAI, kept for signature compat
+        )
 
-        # --- Process results for this batch ---
         with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             for item, idx, resp in zip(batch, batch_idxs, resps):

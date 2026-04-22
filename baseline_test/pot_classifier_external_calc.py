@@ -12,11 +12,18 @@ Step 3 (Verdict):     Structured JSON reasoning → label derived by Logical Rea
                       FACT_1=true, FACT_2=false → "partially true"
                       FACT_1=false → "false"
 
+Batching strategy:
+  Step 1 (PoT code generation) and Step 3 (verdict) are the two LLM calls per sample.
+  Step 2 is a deterministic Python calculator (CPU, fast).
+  exec() of generated code is CPU-only and fast — it runs between Step 1 and Step 3.
+  We batch Step 1 across all samples simultaneously, then exec+Step2 sequentially
+  (CPU, negligible time), then batch Step 3 — keeping the GPU fed at every stage.
+
 Usage:
     python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv
     python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv --samples 20
     python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv --samples 0
-    python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct
+    python baseline_test/pot_classifier_external_calc.py --data data/train_300.csv --model meta-llama/Llama-3.1-8B-Instruct --batch-size 4
 """
 
 import argparse
@@ -151,7 +158,6 @@ params = {{
 ```"""
 
 
-# Step 3 system prompt — structured JSON with three explicit fields for logical reasoner
 STEP3_SYSTEM = """You are a medical fact-checking assistant.
 
 You are given:
@@ -217,10 +223,6 @@ def normalize_label(label: str) -> str:
 
 
 def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
-    """
-    Detect and truncate Qwen-style repetition loops (e.g. "All rights reserved." repeated).
-    If a phrase of phrase_min_len+ chars repeats threshold+ times, cut before it starts.
-    """
     pattern = re.compile(
         r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
         re.DOTALL
@@ -231,39 +233,31 @@ def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3
     return text
 
 
+def _clean_raw(raw: str) -> str:
+    """Strip think tags, repetitions, and markdown fences from model output."""
+    raw = _truncate_repetition(raw)
+    raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+    return raw
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logical Reasoner
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  FACT_1 = all step1_entities have correct=True
-#  FACT_2 = step2_calculation correct=True
-#
-#  FACT_1=True  AND FACT_2=True   →  "true"
-#  FACT_1=True  AND FACT_2=False  →  "partially true"
-#  FACT_1=False (any entity)      →  "false"
-#
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _logical_reasoner(parsed: dict) -> str:
     entities = parsed.get("step1_entities", [])
     calc     = parsed.get("step2_calculation", {})
-
     fact1 = bool(entities) and all(bool(e.get("correct", False)) for e in entities)
     fact2 = bool(calc.get("correct", False))
-
-    if fact1 and fact2:
-        return "true"
-    elif fact1 and not fact2:
-        return "partially true"
-    else:
-        return "false"
+    if fact1 and fact2:       return "true"
+    elif fact1 and not fact2: return "partially true"
+    else:                     return "false"
 
 
 def _keyword_label(text: str) -> str:
     """
-    Last-resort label extraction from free text.
-    Priority: partially true > true > false.
-    Defaults to "false" — never returns "unknown".
+    Last-resort label extraction. Never returns "unknown".
+    WARNING: bare substring matches are a final safety net only.
     """
     t = text.lower()
     if "partially true" in t or "partially_true" in t:
@@ -274,15 +268,11 @@ def _keyword_label(text: str) -> str:
         return "true"
     last_false = t.rfind('"false"')
     last_true  = t.rfind('"true"')
-    if last_false > last_true:
-        return "false"
-    if last_true > last_false:
-        return "true"
-    if "false" in t:
-        return "false"
-    if "true" in t:
-        return "true"
-    return "false"   # safe default — never "unknown"
+    if last_false > last_true:  return "false"
+    if last_true > last_false:  return "true"
+    if "false" in t:            return "false"
+    if "true" in t:             return "true"
+    return "false"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,12 +300,20 @@ def load_dataset(csv_path: str) -> list:
     return rows
 
 
-def load_model(model_name: str):
+def load_model(model_name: str, batch_size: int) -> dict:
+    """
+    Returns {"pipeline": pipe, "model_name": model_name}.
+    low_cpu_mem_usage=True loads weights directly to GPU, cutting load time ~30-50%.
+    batch_size is baked into the pipeline for continuous GPU utilisation.
+    """
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
     print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     has_gpu = torch.cuda.is_available()
     print(f"  GPU available: {has_gpu}")
@@ -331,97 +329,59 @@ def load_model(model_name: str):
                 model_name,
                 quantization_config=bnb_config,
                 device_map="auto",
+                low_cpu_mem_usage=True,
             )
             print("  4-bit quantization enabled (bitsandbytes)")
         except Exception as e:
             print(f"  bitsandbytes not available ({e}), loading in fp16")
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 device_map="auto",
+                low_cpu_mem_usage=True,
             )
     else:
         print("  No GPU, loading on CPU (fp32)")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             device_map="cpu",
+            low_cpu_mem_usage=True,
         )
 
-    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
-    print(f"Model ready: {model_name}")
-    return pipe, model_name
-
-
-def _chat(pipe, _model_name, messages, temperature, max_tokens):
-    do_sample = temperature > 0.0
-    result = pipe(
-        messages,
-        max_new_tokens=max_tokens,
-        temperature=temperature if do_sample else None,
-        do_sample=do_sample,
-        repetition_penalty=1.4,       # raised from 1.2 — prevents Qwen looping
-        return_full_text=False,
+    pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
     )
-    raw = result[0]["generated_text"].strip()
-    return _truncate_repetition(raw)   # safety net for any remaining loops
+    print(f"Model ready: {model_name}  (batch_size={batch_size})")
+    return {"pipeline": pipe, "model_name": model_name}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calculator ID resolver  (classifier name → integer ID)
+# Calculator ID resolver
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CALC_NAME_TO_ID: dict = {}
 
 _CLASSIFIER_ALIASES: dict = {
-    # Wells' DVT (ID 16)
-    "wells' criteria for dvt":                    16,
-    "wells criteria for dvt":                     16,
-    "wells' criteria for deep vein thrombosis":   16,
-    "wells' dvt criteria":                        16,
-    "wells dvt criteria":                         16,
-    "wells dvt score":                            16,
-    "wells dvt":                                  16,
-    # Wells' PE (ID 8)
-    "wells' criteria for pulmonary embolism":     8,
-    "wells criteria for pulmonary embolism":      8,
-    "wells' criteria for pe":                     8,
-    "wells' pe criteria":                         8,
-    "wells pe score":                             8,
-    "wells pe":                                   8,
-    # Maintenance Fluids (ID 22)
-    "maintenance fluids calculations":            22,
-    "maintenance fluids calculation":             22,
-    "maintenance fluid calculations":             22,
-    "holliday-segar":                             22,
-    "holliday segar":                             22,
-    # Centor / McIsaac (ID 20)
-    "centor score (modified/mcisaac)":            20,
-    "centor score":                               20,
-    "modified centor score":                      20,
-    "mcisaac score":                              20,
-    "centor/mcisaac score":                       20,
-    # CCI (ID 32)
-    "charlson comorbidity index":                 32,
-    "cci score":                                  32,
-    "cci":                                        32,
-    # PSI (ID 29)
-    "psi score":                                  29,
-    "pneumonia severity index":                   29,
-    "psi: pneumonia severity index":              29,
-    # HEART (ID 18)
-    "heart score":                                18,
-    # Body Surface Area (ID 60)
-    "body surface area":                          60,
-    "body surface area calculator":               60,
-    "body surface area (mosteller)":              60,
-    "bsa (mosteller)":                            60,
-    "bsa calculator":                             60,
-    # Estimated Date of Conception (ID 68)
-    "estimated date of conception":               68,
-    "estimated of conception":                    68,
-    "estimated conception date":                  68,
-    "date of conception":                         68,
+    "wells' criteria for dvt": 16, "wells criteria for dvt": 16,
+    "wells' criteria for deep vein thrombosis": 16, "wells' dvt criteria": 16,
+    "wells dvt criteria": 16, "wells dvt score": 16, "wells dvt": 16,
+    "wells' criteria for pulmonary embolism": 8, "wells criteria for pulmonary embolism": 8,
+    "wells' criteria for pe": 8, "wells' pe criteria": 8, "wells pe score": 8, "wells pe": 8,
+    "maintenance fluids calculations": 22, "maintenance fluids calculation": 22,
+    "maintenance fluid calculations": 22, "holliday-segar": 22, "holliday segar": 22,
+    "centor score (modified/mcisaac)": 20, "centor score": 20, "modified centor score": 20,
+    "mcisaac score": 20, "centor/mcisaac score": 20,
+    "charlson comorbidity index": 32, "cci score": 32, "cci": 32,
+    "psi score": 29, "pneumonia severity index": 29, "psi: pneumonia severity index": 29,
+    "heart score": 18,
+    "body surface area": 60, "body surface area calculator": 60,
+    "body surface area (mosteller)": 60, "bsa (mosteller)": 60, "bsa calculator": 60,
+    "estimated date of conception": 68, "estimated of conception": 68,
+    "estimated conception date": 68, "date of conception": 68,
 }
 
 _MATCH_STOP = frozenset({
@@ -447,39 +407,39 @@ def _resolve_calculator_id(calc_name: str) -> int:
     global _CALC_NAME_TO_ID
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
-
     key = calc_name.lower().strip()
-
-    if key in _CALC_NAME_TO_ID:
-        return _CALC_NAME_TO_ID[key]
-    if key in _CLASSIFIER_ALIASES:
-        return _CLASSIFIER_ALIASES[key]
+    if key in _CALC_NAME_TO_ID:      return _CALC_NAME_TO_ID[key]
+    if key in _CLASSIFIER_ALIASES:   return _CLASSIFIER_ALIASES[key]
+    for alias, cid in _CLASSIFIER_ALIASES.items():
+        if alias in key or key in alias:
+            return cid
     for name, cid in _CALC_NAME_TO_ID.items():
         if name in key or key in name:
             return cid
-
     key_words = set(re.findall(r'[a-z0-9]+', key)) - _MATCH_STOP
     best_id, best_overlap = 0, 0
     for name, cid in _CALC_NAME_TO_ID.items():
         name_words = set(re.findall(r'[a-z0-9]+', name)) - _MATCH_STOP
         overlap = len(key_words & name_words)
         if overlap > best_overlap:
-            best_overlap = overlap
-            best_id = cid
-
+            best_overlap, best_id = overlap, cid
     if best_overlap >= 3:
         return best_id
-
-    return 0  # unknown — run_calculator will fail gracefully
+    return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: PoT extraction
+# Step 1: PoT code execution
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SAFE_GLOBALS = {"__builtins__": {"round": round, "abs": abs, "int": int,
-                                   "float": float, "str": str, "None": None,
-                                   "True": True, "False": False, "print": print}}
+# Expanded safe builtins — without list/dict/min/max/len/sum/range the generated
+# code silently fails (NameError caught as exec_error → empty params → wrong result).
+_SAFE_GLOBALS = {"__builtins__": {
+    "round": round, "abs": abs, "int": int, "float": float,
+    "str": str, "None": None, "True": True, "False": False,
+    "print": print, "list": list, "dict": dict, "min": min,
+    "max": max, "len": len, "sum": sum, "range": range,
+}}
 
 
 def _exec_code(code: str) -> dict:
@@ -492,86 +452,140 @@ def _exec_code(code: str) -> dict:
     return {k: v for k, v in params.items() if v is not None}
 
 
-def step1_extract(client, model, item: dict, classifier: "FormulaClassifier",
-                  temperature: float, max_tokens: int, ev_limit: int) -> dict:
-    """
-    Returns {"code": str, "parameters": dict, "exec_error": str,
-             "calculator_id": int, "calculator_name": str}
-    """
-    predicted_calc_name = classifier.predict(item["claim"])
-    calc_id = _resolve_calculator_id(predicted_calc_name)
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level batched pipeline call
+# ─────────────────────────────────────────────────────────────────────────────
 
-    hint = f"The calculator for this case is: ID {calc_id} — {predicted_calc_name}"
+def _run_pipeline_batch(model: dict, all_messages: list, temperature: float,
+                        max_tokens: int, repetition_penalty: float) -> list:
+    """
+    Send a list of message-lists to the pipeline in one call.
+    Returns a list of cleaned raw text strings (one per input).
+    Falls back to one-by-one on error; exec errors do NOT trigger the 30s sleep.
+    """
+    pipe      = model["pipeline"]
+    do_sample = temperature > 0.0
+    gen_kwargs = dict(
+        max_new_tokens=max_tokens,
+        temperature=temperature if do_sample else None,
+        do_sample=do_sample,
+        repetition_penalty=repetition_penalty if do_sample else 1.0,
+        return_full_text=False,
+        pad_token_id=pipe.tokenizer.pad_token_id,
+    )
+    try:
+        outputs = pipe(all_messages, **gen_kwargs)
+        return [_clean_raw(o[0]["generated_text"].strip()) for o in outputs]
+    except Exception as e:
+        print(f"  Batch pipeline error ({e}), falling back to one-by-one...")
+        results = []
+        for msgs in all_messages:
+            for attempt in range(3):
+                try:
+                    out = pipe(msgs, **gen_kwargs)
+                    results.append(_clean_raw(out[0]["generated_text"].strip()))
+                    break
+                except Exception as e2:
+                    if attempt < 2:
+                        time.sleep(30 * (attempt + 1))
+                    else:
+                        results.append("")
+        return results
 
-    user_msg = (
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1: batched PoT generation + exec
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_step1_messages(item: dict, classifier: "FormulaClassifier",
+                          ev_limit: int) -> tuple:
+    """Returns (messages, calc_id, calc_name)."""
+    calc_name = classifier.predict(item["claim"])
+    calc_id   = _resolve_calculator_id(calc_name)
+    hint      = f"The calculator for this case is: ID {calc_id} — {calc_name}"
+    user_msg  = (
         f"{hint}\n\n"
         f"Evidence (clinical note):\n{item['evidence'][:ev_limit]}\n\n"
         f"Claim (for context only — do not use claim values):\n"
         f"{item['claim']}\n\n"
         "Write Python code to extract all required parameter values from the evidence. "
-        "Do NOT include the final calculated result in params — only extract raw input values from the evidence. "
+        "Do NOT include the final calculated result in params — only extract raw input values. "
         "Output ONLY the ```python ... ``` code block."
     )
+    msgs = [{"role": "system", "content": STEP1_SYSTEM},
+            {"role": "user",   "content": user_msg}]
+    return msgs, calc_id, calc_name
 
-    raw = _chat(client, model,
-                [{"role": "system", "content": STEP1_SYSTEM},
-                 {"role": "user",   "content": user_msg}],
-                temperature, max_tokens)
 
-    code_match = re.search(r"```python([\s\S]*?)```", raw, re.IGNORECASE)
+def _parse_and_exec_step1(raw: str, calc_id: int, calc_name: str) -> dict:
+    """Parse code block from raw output, exec it, return step1 result dict."""
+    # Strip think wrapper before code search
+    raw_clean = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+
+    code_match = re.search(r"```python([\s\S]*?)```", raw_clean, re.IGNORECASE)
     if not code_match:
-        code_match = re.search(r"```([\s\S]*?)```", raw)
+        code_match = re.search(r"```([\s\S]*?)```", raw_clean)
     if not code_match:
-        code_match = re.search(r"```python([\s\S]+)", raw, re.IGNORECASE)
-    if not code_match:
-        code_match = re.search(r"```([\s\S]+)", raw)
+        code_match = re.search(r"```python([\s\S]+)", raw_clean, re.IGNORECASE)
 
     exec_error = ""
-    params = {}
+    params     = {}
 
     if code_match:
         code = code_match.group(1).strip()
         try:
             params = _exec_code(code)
+            # exec errors are fast failures — do NOT sleep/retry here
         except Exception as e:
             exec_error = f"exec error: {e}"
-            jm = re.search(r"\{[\s\S]*\}", raw)
+            jm = re.search(r"\{[\s\S]*\}", raw_clean)
             if jm:
-                try:
-                    params = json.loads(jm.group())
-                except Exception:
-                    pass
+                try:   params = json.loads(jm.group())
+                except Exception: pass
     else:
         exec_error = "no code block found"
-        jm = re.search(r"\{[\s\S]*\}", raw)
+        jm = re.search(r"\{[\s\S]*\}", raw_clean)
         if jm:
-            try:
-                params = json.loads(jm.group())
-            except Exception:
-                pass
-        code = raw
+            try:   params = json.loads(jm.group())
+            except Exception: pass
+        code = raw_clean
 
     return {
-        "code":            code_match.group(1).strip() if code_match else raw,
+        "code":            code_match.group(1).strip() if code_match else raw_clean,
         "parameters":      params,
         "exec_error":      exec_error,
         "calculator_id":   calc_id,
-        "calculator_name": predicted_calc_name,
+        "calculator_name": calc_name,
     }
 
 
+def run_step1_batch(model: dict, batch: list, classifier: "FormulaClassifier",
+                    ev_limit: int, temperature: float, max_tokens: int,
+                    repetition_penalty: float) -> list:
+    """
+    Generate PoT code for all items in the batch simultaneously (one GPU call),
+    then exec each code block on CPU sequentially (fast).
+    """
+    all_msgs, calc_ids, calc_names = [], [], []
+    for item in batch:
+        msgs, cid, cname = _build_step1_messages(item, classifier, ev_limit)
+        all_msgs.append(msgs)
+        calc_ids.append(cid)
+        calc_names.append(cname)
+
+    raws = _run_pipeline_batch(model, all_msgs, temperature, max_tokens, repetition_penalty)
+    return [_parse_and_exec_step1(raw, cid, cname)
+            for raw, cid, cname in zip(raws, calc_ids, calc_names)]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Verdict — structured JSON → Logical Reasoner
+# Step 3: batched verdict
 # ─────────────────────────────────────────────────────────────────────────────
 
-def step3_verdict(client, model, item: dict,
-                  computed: dict,
-                  temperature: float, max_tokens: int, ev_limit: int) -> dict:
-    """Returns {"reasoning": str, "label": str}"""
+def _build_step3_messages(item: dict, computed: dict, ev_limit: int) -> list:
     computed_str = (f"{computed['value']} {computed['unit']}".strip()
                     if computed.get("value") is not None
                     else f"[calculation error: {computed.get('note', 'unknown')}]")
-
     relevant = item.get("relevant_entities", "").strip()
     user_msg = (
         f"Evidence:\n{item['evidence'][:ev_limit]}\n\n"
@@ -581,58 +595,38 @@ def step3_verdict(client, model, item: dict,
         + (f"Relevant entities from evidence: {relevant}\n\n" if relevant else "\n")
         + "Respond only with the JSON object."
     )
+    return [{"role": "system", "content": STEP3_SYSTEM},
+            {"role": "user",   "content": user_msg}]
 
-    raw = _chat(client, model,
-                [{"role": "system", "content": STEP3_SYSTEM},
-                 {"role": "user",   "content": user_msg}],
-                temperature, max_tokens)
 
+def _parse_step3(raw: str) -> dict:
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-
-    # ── Primary path: structured JSON → logical reasoner ──────────────────
     try:
         parsed = json.loads(clean)
         label  = _logical_reasoner(parsed)
-
-        # If step1_entities was empty, fall back to model's step3_label
         if not parsed.get("step1_entities"):
             fallback = normalize_label(parsed.get("step3_label", ""))
             if fallback in ("true", "partially true", "false"):
                 label = fallback
-
         reasoning_out = json.dumps(
-            {
-                "entities":      parsed.get("step1_entities", []),
-                "calculation":   parsed.get("step2_calculation", {}),
-                "derived_label": label,
-            },
+            {"entities": parsed.get("step1_entities", []),
+             "calculation": parsed.get("step2_calculation", {}),
+             "derived_label": label},
             ensure_ascii=False,
         )
         return {"reasoning": reasoning_out, "label": label}
-
-    # ── Fallback path: JSON failed — scan truncated text for keywords ──────
     except json.JSONDecodeError:
-        return {
-            "reasoning": clean,
-            "label":     _keyword_label(clean),
-        }
+        return {"reasoning": clean, "label": _keyword_label(clean)}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Retry wrapper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _with_retry(fn, *args, retries=3, **kwargs):
-    for attempt in range(retries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            print(f"  [attempt {attempt+1}/{retries}] Error: {e}")
-            if attempt < retries - 1:
-                wait = 30 * (attempt + 1)
-                print(f"  Waiting {wait}s...")
-                time.sleep(wait)
-    return None
+def run_step3_batch(model: dict, items_with_calc: list, computed_list: list,
+                    ev_limit: int, temperature: float, max_tokens: int,
+                    repetition_penalty: float) -> list:
+    """Run Step 3 verdict for all items in the batch simultaneously."""
+    all_msgs = [_build_step3_messages(item, computed, ev_limit)
+                for item, computed in zip(items_with_calc, computed_list)]
+    raws = _run_pipeline_batch(model, all_msgs, temperature, max_tokens, repetition_penalty)
+    return [_parse_step3(raw) for raw in raws]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -696,18 +690,24 @@ def main():
                         help="Max evidence characters (default: 3000)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (default: 0.0)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.4,
+                        help="Repetition penalty when temperature > 0 (default: 1.4)")
     parser.add_argument("--max-tokens-step1", type=int, default=2048,
                         help="Max tokens for Step 1 (default: 2048)")
     parser.add_argument("--max-tokens-step3", type=int, default=1024,
                         help="Max tokens for Step 3 (default: 1024)")
-    parser.add_argument("--delay",      type=float, default=2.0,
-                        help="Seconds between samples (default: 2.0)")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Samples per GPU batch (default: 4; reduce if OOM)")
+    parser.add_argument("--delay",      type=float, default=0.0,
+                        help="Seconds between batches (default: 0.0)")
     parser.add_argument("--output",     default="",
                         help="Output CSV path (auto-generated if empty)")
     parser.add_argument("--classifier", default="./formula_classifier",
-                        help="Path to trained FormulaClassifier directory "
-                             "(default: ./formula_classifier)")
+                        help="Path to trained FormulaClassifier directory")
     args = parser.parse_args()
+
+    if args.random and args.start != 1:
+        print(f"Warning: --start {args.start} is ignored when --random is set.")
 
     # ── Load data ──────────────────────────────────────────────────────────
     all_data = load_dataset(args.data)
@@ -721,13 +721,12 @@ def main():
         subset = all_data[s:s + n] if args.samples != 0 else all_data[s:]
         print(f"Using samples {args.start} to {args.start + len(subset) - 1}")
 
-    # ── Load formula classifier ───────────────────────────────────────────
+    # ── Load classifier + model ───────────────────────────────────────────
     print(f"Loading formula classifier from: {args.classifier}")
     classifier = FormulaClassifier(args.classifier)
     print("Formula classifier ready.\n")
 
-    # ── Load model ────────────────────────────────────────────────────────
-    client, model = load_model(args.model)
+    model = load_model(args.model, args.batch_size)
 
     # ── Prepare output CSV ────────────────────────────────────────────────
     out_path = args.output or (
@@ -740,88 +739,91 @@ def main():
         "evidence", "claim", "true_label", "predicted_label", "match",
         "step1_code", "step1_extracted_params", "step1_exec_error",
         "step2_computed_value", "step2_unit", "step2_error",
-        "step3_reasoning",
-        "ground_truth",
-        "dataset_explanation",
+        "step3_reasoning", "ground_truth", "dataset_explanation",
     ]
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     print(f"Writing results live to: {out_path}\n")
 
-    # ── Evaluation loop ───────────────────────────────────────────────────
+    # ── Batched evaluation loop ───────────────────────────────────────────
     results = []
-    total = len(subset)
+    total   = len(subset)
+    print(f"Starting evaluation ({total} samples, batch_size={args.batch_size})...\n")
 
-    for i, item in enumerate(subset, start=args.start):
-        print(f"[{i}/{args.start + total - 1}] claim: {item['claim'][:80]}...")
+    for batch_start in range(0, total, args.batch_size):
+        batch      = subset[batch_start : batch_start + args.batch_size]
+        batch_idxs = list(range(args.start + batch_start,
+                                args.start + batch_start + len(batch)))
 
-        # ── Step 1: PoT extraction ────────────────────────────────────────
-        s1 = _with_retry(
-            step1_extract,
-            client, model, item, classifier,
-            args.temperature, args.max_tokens_step1, args.ev_limit
+        print(f"[{batch_idxs[0]}–{batch_idxs[-1]}/{args.start + total - 1}] "
+              f"Batch of {len(batch)} — Step 1 (PoT generation)...")
+
+        # ── Step 1: batch code generation + exec ─────────────────────────
+        s1_list = run_step1_batch(
+            model, batch, classifier,
+            args.ev_limit, args.temperature,
+            args.max_tokens_step1, args.repetition_penalty,
         )
-        if s1 is None:
-            s1 = {"code": "ERROR", "parameters": {}, "exec_error": "retry failed",
-                  "calculator_id": 0, "calculator_name": "unknown"}
 
-        print(f"  Classifier → ID {s1['calculator_id']}: {s1['calculator_name']}")
-        if s1["exec_error"]:
-            print(f"  Step 1 exec error: {s1['exec_error']}")
-        print(f"  Step 1 params: {list(s1['parameters'].keys())}")
+        # ── Step 2: calculator (CPU, sequential — fast) ───────────────────
+        computed_list   = []
+        items_with_calc = []
+        for item, s1 in zip(batch, s1_list):
+            computed = run_calculator(s1["calculator_id"], s1["parameters"])
+            computed_list.append(computed)
+            items_with_calc.append({**item,
+                                    "calculator_name": s1["calculator_name"],
+                                    "calculator_id":   s1["calculator_id"]})
+            idx = batch_idxs[batch.index(item)]
+            if s1["exec_error"]:
+                print(f"  [{idx}] exec error: {s1['exec_error']}")
+            print(f"  [{idx}] Classifier→ID {s1['calculator_id']}: {s1['calculator_name']}  "
+                  f"computed={computed['value']} {computed['unit']}"
+                  + (f"  [!] {computed['note']}" if computed.get("note") else ""))
 
-        item_with_calc = {**item,
-                          "calculator_name": s1["calculator_name"],
-                          "calculator_id":   s1["calculator_id"]}
-
-        # ── Step 2: Python calculator ─────────────────────────────────────
-        computed = run_calculator(s1["calculator_id"], s1["parameters"])
-        print(f"  Step 2 computed: {computed['value']} {computed['unit']}"
-              + (f"  [!] {computed['note']}" if computed.get("note") else ""))
-
-        # ── Step 3: Verdict via logical reasoner ──────────────────────────
-        s3 = _with_retry(
-            step3_verdict,
-            client, model, item_with_calc, computed,
-            args.temperature, args.max_tokens_step3, args.ev_limit
+        # ── Step 3: batch verdicts ────────────────────────────────────────
+        print(f"  Step 3 (verdict) for batch...")
+        s3_list = run_step3_batch(
+            model, items_with_calc, computed_list,
+            args.ev_limit, args.temperature,
+            args.max_tokens_step3, args.repetition_penalty,
         )
-        if s3 is None:
-            s3 = {"reasoning": "ERROR", "label": "false"}   # never "unknown"
 
-        predicted = normalize_label(s3["label"])
-        # Ensure predicted is always a valid label
-        if predicted not in ("true", "partially true", "false"):
-            predicted = "false"
-
-        match = predicted == item["label"]
-        print(f"  true={item['label']}  predicted={predicted}  match={match}")
-
-        row = {
-            "index":                      i,
-            "classifier_calculator_id":   s1["calculator_id"],
-            "classifier_calculator_name": s1["calculator_name"],
-            "evidence":                   item["evidence"],
-            "claim":                      item["claim"],
-            "true_label":                 item["label"],
-            "predicted_label":            predicted,
-            "match":                      "TRUE" if match else "FALSE",
-            "step1_code":                 s1["code"].replace("\n", " "),
-            "step1_extracted_params":     json.dumps(s1["parameters"], ensure_ascii=False),
-            "step1_exec_error":           s1["exec_error"],
-            "step2_computed_value":       str(computed.get("value", "")),
-            "step2_unit":                 computed.get("unit", ""),
-            "step2_error":                computed.get("note", ""),
-            "step3_reasoning":            s3["reasoning"].replace("\n", " "),
-            "ground_truth":               item["ground_truth"],
-            "dataset_explanation":        item["explanation"].replace("\n", " "),
-        }
-        results.append({**row, "match": match})
-
+        # ── Write results ─────────────────────────────────────────────────
         with open(out_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writerow(row)
+            for item, idx, s1, computed, s3 in zip(
+                    batch, batch_idxs, s1_list, computed_list, s3_list):
+                predicted = normalize_label(s3["label"])
+                if predicted not in ("true", "partially true", "false"):
+                    predicted = "false"
 
-        if i < args.start + total - 1:
+                match = predicted == item["label"]
+                print(f"  [{idx}] true={item['label']}  predicted={predicted}  match={match}")
+
+                row = {
+                    "index":                      idx,
+                    "classifier_calculator_id":   s1["calculator_id"],
+                    "classifier_calculator_name": s1["calculator_name"],
+                    "evidence":                   item["evidence"],
+                    "claim":                      item["claim"],
+                    "true_label":                 item["label"],
+                    "predicted_label":            predicted,
+                    "match":                      "TRUE" if match else "FALSE",
+                    "step1_code":                 s1["code"].replace("\n", " "),
+                    "step1_extracted_params":     json.dumps(s1["parameters"], ensure_ascii=False),
+                    "step1_exec_error":           s1["exec_error"],
+                    "step2_computed_value":       str(computed.get("value", "")),
+                    "step2_unit":                 computed.get("unit", ""),
+                    "step2_error":                computed.get("note", ""),
+                    "step3_reasoning":            s3["reasoning"].replace("\n", " "),
+                    "ground_truth":               item["ground_truth"],
+                    "dataset_explanation":        item["explanation"].replace("\n", " "),
+                }
+                results.append({**row, "match": match})
+                writer.writerow(row)
+
+        if args.delay > 0 and batch_start + args.batch_size < total:
             time.sleep(args.delay)
 
     print_summary(results)

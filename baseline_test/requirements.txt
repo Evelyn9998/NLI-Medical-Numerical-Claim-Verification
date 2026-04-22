@@ -1,0 +1,12 @@
+torch>=2.5.0
+transformers>=4.51.0
+tokenizers>=0.22.0
+huggingface_hub>=0.23.0
+sentencepiece
+tiktoken
+httpx[socks]
+scikit-learn
+numpy<2.0.0
+accelerate
+safetensors
+openai
