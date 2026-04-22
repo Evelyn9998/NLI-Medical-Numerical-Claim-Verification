@@ -236,9 +236,12 @@ def print_paper_metrics(name, tf=None, cs=None, qp=None):
 GT_FILE = "mrt_claim_cleaned.csv"
 
 FILES = {
-    "ZS-CoT (zs_cot_mrt_770)":   "results/zs_cot_mrt_770.csv",
-    "CoT-CLF (cot_clf_mrt_full)": "results/cot_clf_mrt_full.csv",
-    "PoT-CLF (pot_clf_mrt_full)": "results/pot_clf_mrt_full.csv",
+    "ZS GPT (results_zs_gpt_full)": "results_zs_gpt_full.csv",
+}
+
+# Pipeline types: "zs" for zero-shot (no CS/QP), "clf" for classifier pipelines (CS+QP)
+FILE_TYPES = {
+    "ZS GPT (results_zs_gpt_full)": "zs",
 }
 
 if __name__ == "__main__":
@@ -252,13 +255,10 @@ if __name__ == "__main__":
         rows = load_rows(path)
         tf = compute_task_fulfillment(rows)
 
-        if name == "ZS-CoT (zs_cot_mrt_770)":
-            # No calculator selection step; no computed numeric values.
+        if FILE_TYPES.get(name) == "zs":
             print_paper_metrics(name, tf=tf, cs=None, qp=None)
 
-        elif name in ("CoT-CLF (cot_clf_mrt_full)", "PoT-CLF (pot_clf_mrt_full)"):
-            # Join GT columns (Calculator ID, Lower Limit, Upper Limit) by row index.
-            # cot_clf row "index" matches GT "Row Number".
+        elif FILE_TYPES.get(name) == "clf":
             joined = join_gt_columns_by_position(
                 rows, gt_rows,
                 columns=["Calculator ID", "Lower Limit", "Upper Limit"],

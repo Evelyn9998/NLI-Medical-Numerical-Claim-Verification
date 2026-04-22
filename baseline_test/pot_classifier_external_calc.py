@@ -39,7 +39,7 @@ from datetime import datetime
 # Add project root to path so we can import calculators
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from calculators import run_calculator
-from train_formula_classifier import FormulaClassifier, QTC_VARIANTS
+from baseline_test.train_formula_classifier_cot_gpt import FormulaClassifier, QTC_VARIANTS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Calculator reference list
