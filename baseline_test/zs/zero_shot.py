@@ -1,7 +1,12 @@
 """
 LLM Fact-Check Evaluator
-Uses Llama-3.1-8B-Instruct, Qwen, or DeepSeek-R1 via local HuggingFace model.
-Zero-shot Direct Prompting: Evidence + Claim -> Structured reasoning -> Label via Logical Reasoner.
+Uses DeepSeek-R1-7B (or Llama-3.1-8B-Instruct / Qwen) via local HuggingFace model.
+Zero-shot Direct Prompting: Evidence + Claim -> JSON label via Logical Reasoner.
+
+Prompting strategy: Direct prompting (no explicit Chain-of-Thought steps in the
+prompt). DeepSeek R1 reasons internally via its <think> block by default; the
+system prompt states the task and JSON schema directly without coaching the model
+through numbered steps.
 
 Benchmark accuracy criteria (MedCalc-Bench §3.1, Table 2):
   - Rule-based calculators (integer scores from summed criteria) : exact match
@@ -11,23 +16,25 @@ Benchmark accuracy criteria (MedCalc-Bench §3.1, Table 2):
 The model self-classifies the calculator type from the claim and applies
 the correct criterion. No Category column is required in the dataset.
 
-On the Python side, _override_step2_by_criteria infers the criterion solely
-from the model's calculator_type field and the shape of correct_result:
-  - model says "rule-based" or "date-based", OR value is an integer / date  -> exact match
-  - model says "equation-based",             OR value is a decimal           -> 5% tolerance
-
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
+
+Reproducibility controls:
+  - Always fp16 (4-bit quantization removed; consistent precision across GPUs)
+  - --batch-size defaults to 1 (eliminates padding-induced numerical drift)
+  - FIXED_SEED = 42 hardcoded; seeds torch / random / numpy before any operation
+  - Greedy decoding (temperature=0, do_sample=False) is enforced throughout
+  - torch.backends.cudnn.deterministic = True
 
 Install dependencies:
     pip install transformers torch
 
 Usage:
-    python zero_shot_CoT.py --data "mrt_claim_cleaned.csv" --model "$HOME/models/DeepSeek-R1"
-    python zero_shot_CoT.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct"
-    python zero_shot_CoT.py --data "train_300.csv"          --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
-    python zero_shot_CoT.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
-    python zero_shot_CoT.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --batch-size 4
+    python zero_shot.py --data "mrt_claim_cleaned.csv" --model "$HOME/models/DeepSeek-R1-7B"
+    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct"
+    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
+    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
+    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --batch-size 1
 """
 
 import argparse
@@ -41,255 +48,46 @@ import time
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# System prompt — optimised for DeepSeek R1 (also compatible with Llama / Qwen)
+# Fixed random seed — hardcoded to ensure full reproducibility without needing
+# a CLI flag. Seeds Python / NumPy / PyTorch before any data or model op.
+# ---------------------------------------------------------------------------
+FIXED_SEED = 42
+
+# ---------------------------------------------------------------------------
+# System prompt — Zero-shot Direct Prompting for DeepSeek R1 7B
+#
+# Pure direct prompt: no reasoning structure, no JSON schema, no step
+# decomposition. The model receives the task definition and label options only.
+# DeepSeek R1 reasons internally via its <think> block; we strip that block
+# in _parse_response and extract the label from the remaining free text.
+#
+# This is the baseline. Structured reasoning (CoT, PoT, etc.) will be
+# introduced as separate prompting strategies on top of this foundation.
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a medical fact-checking assistant. Given clinical evidence and a clinical claim, determine whether the claim is TRUE, PARTIALLY TRUE, or FALSE.
 
-The claim contains two types of sub-claims:
-- Extractive Claims: parameter values that can be read directly from the evidence without computation (e.g., patient age, presence of hypertension, troponin level).
-- One Implicit Calculation Claim: the final score or derived value, which requires applying a medical formula or rule-based scoring system to evidence parameters.
+The claim is a comma-separated list of entities. All segments EXCEPT the last are input parameters; the LAST segment is the final computed result.
 
----
-STEP 1 — Check each INPUT entity (every comma-separated segment EXCEPT the last):
+Check each input entity against the evidence, compute the correct result using evidence-derived values, and assign the label:
+- "true"          : ALL input entities match the evidence AND the computed result matches the claimed result.
+- "partially true": ALL input entities match the evidence BUT the computed result does NOT match.
+- "false"         : ANY input entity does NOT match the evidence.
 
-HOW TO SPLIT THE CLAIM:
-Split the claim on every comma ( , ). Each segment is one entity.
-  - Every segment EXCEPT the last → INPUT parameters → go in step1_entities
-  - The LAST segment              → final computed result → goes ONLY in step2_calculation
+Use the appropriate accuracy criterion:
+- Rule-based calculator (integer score — e.g. HEART, CHA2DS2-VASc, Wells, CURB-65, GCS, Caprini, APACHE II, SOFA): exact match.
+- Equation-based calculator (decimal output — e.g. GFR, LDL, BMI, MAP, FIB-4, Anion Gap, Serum Osmolality, Cockcroft-Gault, Framingham Risk): within 5%, i.e. |claimed − correct| / |correct| ≤ 0.05.
+- Date-based calculator (calendar date — e.g. Estimated Due Date, Gestational Age): exact match.
 
-CRITICAL: The last comma-separated segment is ALWAYS the Implicit Calculation Claim.
-It must NOT appear in step1_entities. If you include it there, your answer is wrong.
-
-EXAMPLE:
-  Claim: "Based on the patient's data where the Calcium is 7.2 mg/dL,
-          the Albumin is 3.2 g/dL,
-          the Corrected Calcium Concentration is 7.84 mg/dL."
-
-  Split by comma → 3 segments:
-    Segment 1: "Based on the patient's data where the Calcium is 7.2 mg/dL"
-    Segment 2: "the Albumin is 3.2 g/dL"
-    Segment 3: "the Corrected Calcium Concentration is 7.84 mg/dL."  ← LAST = step2 only
-
-  step1_entities:    Calcium (7.2 mg/dL), Albumin (3.2 g/dL)
-  step2_calculation: Corrected Calcium Concentration claimed = 7.84 mg/dL
-
-CORRECTNESS RULES for each INPUT entity in step1_entities:
-- A positively-framed entity (e.g., "Liver disease criteria for HAS-BLED") describes a condition that must be present in the evidence. If it is not found, mark correct = false.
-- A negatively-framed entity (e.g., "Cough Absent") describes the absence of a condition. If the condition is not mentioned in the evidence, the absence is confirmed — mark correct = true.
-
----
-STEP 2 — Evaluate the final computed result (step2_calculation):
-
-Parameter extraction:
-The claim may contain intentionally incorrect input values. Always extract all parameter values from the Evidence, not from the claim. Show the full formula name and expression, substitute every evidence-derived value, and show every arithmetic step before recording correct_result.
-
-Accuracy criteria — infer the calculator type from the claim and apply the appropriate rule:
-
-  Rule-based calculator: produces an integer score by summing criteria
-  (e.g., HEART Score, CHA2DS2-VASc Score, Wells' Criteria for DVT/PE,
-  CURB-65, Glasgow Coma Score, Caprini Score, APACHE II, SOFA Score).
-  -> claimed_result must EXACTLY match correct_result (integer comparison).
-
-  Equation-based calculator: produces a continuous decimal value via a formula
-  (e.g., GFR, LDL, BMI, MAP, FIB-4 Index, Anion Gap, Serum Osmolality,
-  Cockcroft-Gault, Framingham Risk Score).
-  -> claimed_result is correct if it is within 5% of correct_result,
-    i.e. |claimed - correct| / |correct| <= 0.05.
-
-  Date-based calculator: produces a calendar date
-  (e.g., Estimated Due Date, Estimated Date of Conception,
-  Estimated Gestational Age).
-  -> claimed_result must EXACTLY match correct_result (string comparison).
-
----
-DERIVING THE LABEL — apply this rule exactly, with no exceptions:
-  - All step1_entities correct = true  AND step2_calculation correct = true  -> "true"
-  - All step1_entities correct = true  AND step2_calculation correct = false -> "partially true"
-  - Any  step1_entity   correct = false (regardless of step2)               -> "false"
-
----
-You may reason freely inside <think> tags. After your reasoning, output ONLY the JSON object below — no markdown fences, no preamble, no text after the closing brace.
-
-{
-  "step1_entities": [
-    {
-      "name": "<INPUT parameter name from the 'where' clause — NEVER the calculator name or its final output>",
-      "claim_value": "<value stated in the claim>",
-      "evidence_value": "<value found in evidence, or 'not found'>",
-      "correct": true or false
-    }
-  ],
-  "step2_calculation": {
-    "calculator_type": "<rule-based | equation-based | date-based>",
-    "formula": "<formula name and expression>",
-    "substitution": "<formula with evidence-derived values substituted in>",
-    "steps": "<every arithmetic step shown>",
-    "correct_result": "<your computed answer, with units if applicable>",
-    "claimed_result": "<the final 'the [calculator name] is [value]' from the claim>",
-    "correct": true or false
-  },
-  "step3_label": "<true|partially true|false>"
-}"""
+For every INPUT entity (all except the last) mentioned in the claim, check the evidence and set:
+- correct = true  if the claim value matches the evidence value.
+- correct = false if the claim value does not match, or if a required condition is absent.
+Special cases:
+  - A positively-framed entity (e.g., "Liver disease criteria for HAS-BLED") must be present in the evidence. If not found → correct = false.
+  - A negatively-framed entity (e.g., "Cough Absent") describes absence. If the condition is not mentioned in the evidence → correct = true."""
 
 
-# ---------------------------------------------------------------------------
-# Benchmark accuracy criteria — mirrors MedCalc-Bench §3.1 Table 2
-#
-# The criterion is inferred entirely from the model's own output — no external
-# metadata column is needed or used.
-#
-# Priority:
-#   1. Model's calculator_type field  ("rule-based" / "date-based" / "equation-based")
-#   2. Shape of correct_result:
-#        - matches MM/DD/YYYY            -> date-based  -> exact match
-#        - numeric with no decimal point -> rule-based  -> exact match
-#        - numeric with decimal point    -> equation-based -> 5% tolerance
-#        - unparseable                   -> exact match (safe default)
-# ---------------------------------------------------------------------------
 
-# Model's self-reported calculator_type values that map to each criterion
-_MODEL_EXACT_TYPES     = {'rule-based', 'date-based'}
-_MODEL_TOLERANCE_TYPES = {'equation-based'}
-
-# Date pattern used by MedCalc-Bench (MM/DD/YYYY)
-_DATE_RE = re.compile(r'^\d{1,2}/\d{1,2}/\d{4}$')
-
-
-def _infer_criteria(correct_result_str: str, model_calc_type: str = "") -> str:
-    """
-    Infer which accuracy criterion to apply.
-    Returns one of: "exact" | "tolerance"
-
-    Priority:
-      1. Model's self-reported calculator_type field.
-      2. Shape of correct_result string.
-    """
-    # 1. Trust the model's self-classification when present and recognised
-    mct = (model_calc_type or "").strip().lower()
-    if mct in _MODEL_EXACT_TYPES:
-        return "exact"
-    if mct in _MODEL_TOLERANCE_TYPES:
-        return "tolerance"
-
-    # 2. Fall back to value-shape heuristic
-    s = correct_result_str.strip()
-
-    if _DATE_RE.match(s):           # MM/DD/YYYY -> date-based -> exact
-        return "exact"
-
-    num_part = re.sub(r'[^\d.\-]', '', s).strip()
-    if not num_part:                # unparseable -> safe default
-        return "exact"
-    if '.' not in num_part:         # integer -> rule-based -> exact
-        return "exact"
-    return "tolerance"              # decimal -> equation-based -> 5%
-
-
-def _override_step2_by_criteria(parsed: dict) -> dict:
-    """
-    Re-evaluate step2_calculation.correct using the benchmark's accuracy
-    criteria inferred from the model's own JSON output.
-    Mutates parsed in-place and returns it.
-    Falls back to the model's own judgment when values cannot be parsed.
-    """
-    calc    = parsed.get("step2_calculation", {})
-    cr_str  = str(calc.get("correct_result",  "")).strip()
-    clm_str = str(calc.get("claimed_result", "")).strip()
-    mct     = str(calc.get("calculator_type", "")).strip().lower()
-
-    # Cannot validate when values are missing or placeholder text
-    if not cr_str or not clm_str or "(unknown)" in cr_str or "(unknown)" in clm_str:
-        return parsed
-
-    criterion = _infer_criteria(cr_str, mct)
-
-    if criterion == "exact":
-        cr_core  = re.sub(r'[^\d.\-]', '', cr_str).strip()
-        clm_core = re.sub(r'[^\d.\-]', '', clm_str).strip()
-        if cr_core and clm_core:
-            correct = (cr_core == clm_core)
-        else:
-            # Full-string fallback handles date strings containing slashes
-            correct = (cr_str.lower() == clm_str.lower())
-
-    else:  # "tolerance"
-        try:
-            cr_m  = re.search(r'[\-\d.]+', cr_str)
-            clm_m = re.search(r'[\-\d.]+', clm_str)
-            if cr_m and clm_m:
-                cr_val  = float(cr_m.group())
-                clm_val = float(clm_m.group())
-                if cr_val == 0:
-                    correct = (clm_val == 0)
-                else:
-                    correct = abs(cr_val - clm_val) / abs(cr_val) <= 0.05
-            else:
-                return parsed   # no numeric content — leave model's judgment
-        except (ValueError, TypeError):
-            return parsed
-
-    calc["correct"] = correct
-    return parsed
-
-
-def _remove_implicit_from_step1(parsed: dict, claim: str = "") -> dict:
-    """
-    Python-side safety net: remove the implicit calculation claim from
-    step1_entities before the Logical Reasoner runs.
-
-    Identification strategy — split the claim by commas:
-      The claim is a comma-separated list of entities. The LAST segment is
-      always the final computed result (step2); every other segment is an
-      extractive input parameter (step1).
-
-    Secondary source: step2_calculation.formula field (text before = or :).
-
-    Matching: case-insensitive. An entity is removed when the extracted
-    output name equals or is contained in the entity name — never the
-    reverse, to avoid false positives (e.g., "Albumin" must not be removed
-    just because the output is "Albumin Corrected Delta Ratio").
-    """
-    entities = parsed.get("step1_entities", [])
-    if not entities:
-        return parsed
-
-    output_names = set()
-
-    # Primary source — last comma-separated segment of the claim
-    if claim:
-        parts = [p.strip() for p in claim.split(",")]
-        if parts:
-            last_seg = parts[-1].rstrip(".")
-            m = re.search(r"the\s+(.+?)\s+is\s+", last_seg, re.IGNORECASE)
-            if m:
-                output_names.add(m.group(1).strip().lower())
-
-    # Secondary source — formula field in step2_calculation
-    formula = parsed.get("step2_calculation", {}).get("formula", "")
-    if formula:
-        formula_name = re.split(r"[=:(]", formula)[0].strip().lower()
-        if formula_name:
-            output_names.add(formula_name)
-
-    if not output_names:
-        return parsed
-
-    def _is_implicit(entity_name):
-        n = entity_name.strip().lower()
-        # Remove when output name equals entity name, or output name is
-        # contained in entity name (handles unit suffixes, e.g. "Anion Gap (mEq/L)").
-        # Never remove when entity name is contained in output name — that
-        # would cause false positives for shared substrings like "Albumin".
-        return any(n == out or out in n for out in output_names)
-
-    filtered = [e for e in entities if not _is_implicit(e.get("name", ""))]
-
-    # Only apply the filter when it actually removes something
-    if len(filtered) < len(entities):
-        parsed["step1_entities"] = filtered
-
-    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +106,6 @@ def normalize_label(label: str) -> str:
 
 
 def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3) -> str:
-    """
-    If any substring of phrase_min_len+ chars repeats threshold+ times
-    consecutively, truncate the text just before the repetition starts.
-    Handles Qwen / R1 looping issues.
-    """
     pattern = re.compile(
         r'(.{' + str(phrase_min_len) + r',}?)\1{' + str(threshold - 1) + r',}',
         re.DOTALL
@@ -321,38 +114,6 @@ def _truncate_repetition(text: str, phrase_min_len: int = 20, threshold: int = 3
     if m:
         return text[:m.start()].strip()
     return text
-
-
-# ---------------------------------------------------------------------------
-# Logical Reasoner
-# ---------------------------------------------------------------------------
-#
-#  Label definitions (ground truth):
-#
-#  TRUE          : ALL step1 entities correct=true  AND step2 correct=true
-#  PARTIALLY TRUE: ALL step1 entities correct=true  AND step2 correct=false
-#  FALSE         : ANY step1 entity  correct=false  (step2 value irrelevant)
-#
-#  Note: step2.correct is re-evaluated by _override_step2_by_criteria before
-#  this function runs, so the benchmark accuracy criteria are already applied.
-#
-# ---------------------------------------------------------------------------
-
-def _logical_reasoner(parsed: dict) -> str:
-    entities = parsed.get("step1_entities", [])
-    calc     = parsed.get("step2_calculation", {})
-
-    fact1 = bool(entities) and all(
-        bool(e.get("correct", False)) for e in entities
-    )
-    fact2 = bool(calc.get("correct", False))
-
-    if fact1 and fact2:
-        return "true"
-    elif fact1 and not fact2:
-        return "partially true"
-    else:
-        return "false"
 
 
 # ---------------------------------------------------------------------------
@@ -380,15 +141,19 @@ def load_dataset(csv_path: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Model loading  (always fp16 — no 4-bit quantization)
 # ---------------------------------------------------------------------------
 
 def load_model(model_name: str, batch_size: int) -> dict:
     """
-    Returns {"pipeline": pipe, "model_name": model_name}.
-    batch_size is baked into the pipeline so the GPU stays fed continuously.
-    low_cpu_mem_usage=True loads weights directly to GPU layer-by-layer,
-    cutting model load time by ~30-50% vs. the default full-CPU-then-move path.
+    Load the model in fp16 on GPU, or fp32 on CPU.
+
+    4-bit quantization has been intentionally removed:
+      - bitsandbytes quantization introduces hardware-dependent rounding error
+        that varies between GPU architectures, making results non-reproducible
+        across different machines even with the same seed and batch size.
+      - fp16 is consistent across GPUs of the same compute capability and
+        is the correct baseline for controlled experiments.
     """
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -396,37 +161,25 @@ def load_model(model_name: str, batch_size: int) -> dict:
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-    # Padding token required for batched inference — use eos_token if absent
+    # Ensure a pad token exists; use left-padding to keep the generated
+    # token positions stable regardless of sequence length in a batch.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     has_gpu = torch.cuda.is_available()
     print(f"  GPU available: {has_gpu}")
 
     if has_gpu:
-        try:
-            from transformers import BitsAndBytesConfig
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-            print("  4-bit quantization enabled (bitsandbytes)")
-        except Exception as e:
-            print(f"  bitsandbytes not available ({e}), loading in fp16")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
+        print("  Loading in fp16 (deterministic across same GPU architecture)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
     else:
-        print("  No GPU, loading on CPU (fp32)")
+        print("  No GPU — loading in fp32 on CPU")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float32,
@@ -440,7 +193,7 @@ def load_model(model_name: str, batch_size: int) -> dict:
         tokenizer=tokenizer,
         batch_size=batch_size,
     )
-    print(f"Model ready: {model_name}  (batch_size={batch_size})")
+    print(f"Model ready: {model_name}  (batch_size={batch_size}, dtype=fp16)")
     return {"pipeline": pipe, "model_name": model_name}
 
 
@@ -452,81 +205,30 @@ def _parse_response(raw_text: str, claim: str = "") -> dict:
     """
     Convert raw model text into {"reasoning": str, "label": str}.
 
-    Processing order:
-      1. Truncate runaway repetitions (Qwen / R1 looping guard).
-      2. Strip <think>...</think> blocks emitted by reasoning models (R1).
-      3. Strip markdown fences if present.
-      4. Parse JSON.
-      5. _remove_implicit_from_step1: strip the calculator output from step1
-         before it can corrupt the Logical Reasoner.
-      6. _override_step2_by_criteria: enforce benchmark accuracy tolerance.
-      7. _logical_reasoner: derive the final label.
-      8. If JSON fails, fall back to _keyword_label on the cleaned text.
+    Pipeline:
+      1. Truncate runaway repetitions (R1 looping guard).
+      2. Strip <think> blocks (DeepSeek R1 internal reasoning) in all forms:
+           a. Properly closed  <think>...</think>
+           b. Orphaned </think> with no opening tag
+           c. Unclosed <think> — model ran out of tokens mid-thinking
+      3. Extract the label from the remaining free text via _keyword_label.
     """
     raw_text = _truncate_repetition(raw_text)
 
-    # ── Strip reasoning blocks ─────────────────────────────────────────────
-    # Case 1: model wraps reasoning in proper <think>...</think> tags
+    # ── Strip <think> reasoning block (DeepSeek R1) ────────────────────────
+    # Case a: properly closed <think>...</think>
     raw_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text, flags=re.IGNORECASE).strip()
-    # Case 2: model emits reasoning WITHOUT an opening <think> tag, ending
-    # with a bare </think> before the JSON (observed in DeepSeek-R1 outputs).
-    # Strip everything up to and including the orphaned </think>.
+    # Case b: orphaned </think> with no opening tag
     raw_text = re.sub(r"^[\s\S]*?</think>", "", raw_text, flags=re.IGNORECASE).strip()
+    # Case c: unclosed <think> — strip from <think> to end of string
+    if re.search(r"<think>", raw_text, re.IGNORECASE):
+        raw_text = re.sub(r"<think>[\s\S]*$", "", raw_text, flags=re.IGNORECASE).strip()
 
-    clean = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+    clean = raw_text.strip()
 
-    # ── JSON extraction ────────────────────────────────────────────────────
-    parsed = None
-
-    # Attempt 1: direct parse (clean text is pure JSON)
-    try:
-        parsed = json.loads(clean)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: model prefixed JSON with free text — find the object boundary
-    if parsed is None:
-        for m in re.finditer(r"\{", clean):
-            candidate = clean[m.start():]
-            last = candidate.rfind("}")
-            if last == -1:
-                continue
-            try:
-                parsed = json.loads(candidate[:last + 1])
-                break
-            except json.JSONDecodeError:
-                continue
-
-    # ── Structured path ────────────────────────────────────────────────────
-    if parsed is not None:
-        # Remove any implicit calculation claim that leaked into step1_entities
-        parsed = _remove_implicit_from_step1(parsed, claim)
-
-        # Apply benchmark accuracy criteria using only the model's own output
-        parsed = _override_step2_by_criteria(parsed)
-
-        label = _logical_reasoner(parsed)
-
-        # Safety: if step1_entities is empty after cleanup, use the model's
-        # own step3_label rather than silently defaulting to "false".
-        if not parsed.get("step1_entities"):
-            fallback = normalize_label(parsed.get("step3_label", ""))
-            if fallback in ("true", "partially true", "false"):
-                label = fallback
-
-        reasoning_out = json.dumps(
-            {
-                "entities":      parsed.get("step1_entities", []),
-                "calculation":   parsed.get("step2_calculation", {}),
-                "derived_label": label,
-            },
-            ensure_ascii=False,
-            indent=None,
-        )
-        return {"reasoning": reasoning_out, "label": label}
-
-    # ── Fallback: no JSON found anywhere ──────────────────────────────────
-    return {"reasoning": clean, "label": _keyword_label(clean)}
+    # ── Extract label from free text ───────────────────────────────────────
+    label = _keyword_label(clean)
+    return {"reasoning": clean, "label": label}
 
 
 def _keyword_label(text: str) -> str:
@@ -559,13 +261,21 @@ def _keyword_label(text: str) -> str:
 # Batched inference
 # ---------------------------------------------------------------------------
 
-def _build_messages(item: dict, ev_limit: int) -> list:
-    """Build the chat message list for one sample."""
+def _build_messages(item: dict, ev_limit: int, no_think: bool = False) -> list:
+    """
+    Build the chat message list for one sample.
+
+    Direct prompting: the user message contains only the evidence and claim.
+    No JSON instructions, no step scaffolding.
+
+    no_think is accepted for interface compatibility but has no effect here —
+    DeepSeek R1's internal <think> block is stripped in _parse_response.
+    """
     user_msg = (
         f"Evidence:\n{item['evidence'][:ev_limit]}\n\n"
-        f"Claim:\n{item['claim']}\n\n"
-        "Respond only with the JSON object."
+        f"Claim:\n{item['claim']}"
     )
+
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": user_msg},
@@ -573,34 +283,29 @@ def _build_messages(item: dict, ev_limit: int) -> list:
 
 
 def run_batch(model: dict, batch: list, ev_limit: int,
-              temperature: float, max_tokens: int,
-              repetition_penalty: float) -> list:
+              max_tokens: int,
+              no_think: bool = False) -> list:
     """
-    Run inference on a list of items in one pipeline call.
+    Run greedy (temperature=0) inference on a list of items in one pipeline call.
     Returns a list of {"reasoning": str, "label": str} dicts, one per item.
 
-    Note on repetition_penalty with temperature = 0:
-      When do_sample=False (greedy decoding), the pipeline ignores
-      repetition_penalty regardless of the argument value, so the default
-      of 1.0 has no practical effect in that mode. The argument only
-      matters when temperature > 0.
+    temperature and repetition_penalty arguments have been removed:
+      - do_sample=False (greedy) is always used for reproducibility.
+      - repetition_penalty has no effect under greedy decoding and is omitted.
     """
-    pipe      = model["pipeline"]
-    do_sample = temperature > 0.0
-
-    all_messages = [_build_messages(item, ev_limit) for item in batch]
+    pipe         = model["pipeline"]
+    all_messages = [_build_messages(item, ev_limit, no_think=no_think) for item in batch]
 
     results = pipe(
         all_messages,
         max_new_tokens=max_tokens,
-        temperature=temperature if do_sample else None,
-        do_sample=do_sample,
-        repetition_penalty=repetition_penalty if do_sample else 1.0,
+        do_sample=False,          # greedy decoding — deterministic
+        temperature=None,         # must be None when do_sample=False
+        repetition_penalty=1.0,   # no penalty; no effect under greedy anyway
         return_full_text=False,
         pad_token_id=pipe.tokenizer.pad_token_id,
     )
 
-    # pipeline returns List[List[dict]] when given a list of inputs
     return [
         _parse_response(r[0]["generated_text"].strip(), item.get("claim", ""))
         for r, item in zip(results, batch)
@@ -665,36 +370,72 @@ def main():
                         help="Randomly sample instead of taking from the start")
     parser.add_argument("--ev-limit", type=int, default=2000,
                         help="Max characters of Evidence passed to model (default: 2000)")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help=(
-                            "Sampling temperature (default: 0.0 for greedy/deterministic "
-                            "decoding). With temperature=0, repetition_penalty has no effect."
-                        ))
-    parser.add_argument("--repetition-penalty", type=float, default=1.0,
-                        help=(
-                            "Repetition penalty applied only when temperature > 0 "
-                            "(default: 1.0). 1.0 (no penalty) is recommended for "
-                            "DeepSeek-R1 and for greedy decoding where this argument "
-                            "has no effect."
-                        ))
     parser.add_argument("--max-tokens", type=int, default=4096,
                         help=(
                             "Max output tokens per inference (default: 4096). "
-                            "Set higher for DeepSeek-R1 whose <think> blocks "
-                            "typically run 2000-8000 tokens."
+                            "Llama outputs JSON directly without a reasoning block, "
+                            "so 2048 is sufficient. For Qwen without --no-think, "
+                            "increase to 8192 to fit the <think> block + JSON."
                         ))
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Samples per GPU batch (default: 4; reduce if OOM)")
+    # -----------------------------------------------------------------------
+    # Reproducibility: batch-size defaults to 1.
+    #
+    # When batch_size > 1, sequences are padded to the same length inside the
+    # batch. Even with causal masking, different padding lengths change the
+    # floating-point accumulation in attention layers, so the same sample can
+    # produce a different output depending on which other samples it is batched
+    # with. batch_size=1 eliminates this entirely.
+    #
+    # If you increase batch_size for throughput, results may differ from a
+    # batch_size=1 run — this is expected and not a bug.
+    # -----------------------------------------------------------------------
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help=(
+                            "Samples per GPU batch (default: 1 for reproducibility). "
+                            "Increasing this pads sequences together and causes "
+                            "non-deterministic results across different batch sizes "
+                            "or GPU architectures. Increase only for throughput "
+                            "experiments where exact reproducibility is not required."
+                        ))
     parser.add_argument("--start", type=int, default=1,
                         help="1-based index to start from (default: 1)")
     parser.add_argument("--delay", type=float, default=0.0,
                         help="Seconds to sleep between batches (default: 0.0)")
     parser.add_argument("--output", default="",
                         help="Output CSV path (default: auto-generated with timestamp)")
+    parser.add_argument("--no-think", action="store_true",
+                        help=(
+                            "Prepend '/no_think' to user messages. "
+                            "Disables the <think> reasoning block for Qwen3 thinking "
+                            "models, so the full JSON fits within --max-tokens. "
+                            "Has no effect on DeepSeek R1 or Llama."
+                        ))
     args = parser.parse_args()
+
+    # -----------------------------------------------------------------------
+    # Seed everything before any data or model operation.
+    # FIXED_SEED is hardcoded (= 42) — no CLI flag needed.
+    # Combined with batch_size=1 and greedy decoding this makes results fully
+    # reproducible on the same GPU architecture.
+    # -----------------------------------------------------------------------
+    import numpy as np
+    import torch
+
+    random.seed(FIXED_SEED)
+    np.random.seed(FIXED_SEED)
+    torch.manual_seed(FIXED_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(FIXED_SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark     = False
+
+    print(f"Seed: {FIXED_SEED} (fixed)  |  batch_size: {args.batch_size}  |  dtype: fp16  |  decoding: greedy")
 
     if args.random and args.start != 1:
         print(f"Warning: --start {args.start} is ignored when --random is set.")
+
+    if args.no_think:
+        print("--no-think enabled: prepending '/no_think' to all user messages.")
 
     # -- Load data ---------------------------------------------------------
     all_data = load_dataset(args.data)
@@ -702,7 +443,7 @@ def main():
 
     if args.random:
         subset = random.sample(all_data, n)
-        print(f"Randomly selected {n} samples")
+        print(f"Randomly selected {n} samples (seed={FIXED_SEED})")
     else:
         start_idx = args.start - 1
         subset = (all_data[start_idx:start_idx + n]
@@ -736,11 +477,11 @@ def main():
         print(f"[{batch_idxs[0]}-{batch_idxs[-1]}/{args.start + total - 1}] "
               f"Running batch of {len(batch)}...")
 
-        # Attempt the whole batch; fall back to per-sample on failure
         try:
             resps = run_batch(
                 model, batch, args.ev_limit,
-                args.temperature, args.max_tokens, args.repetition_penalty,
+                args.max_tokens,
+                no_think=args.no_think,
             )
         except Exception as e:
             print(f"  Batch error ({e}), falling back to one-by-one...")
@@ -748,17 +489,15 @@ def main():
             for item in batch:
                 for attempt in range(3):
                     try:
-                        msgs      = _build_messages(item, args.ev_limit)
-                        pipe      = model["pipeline"]
-                        do_sample = args.temperature > 0.0
-                        raw = pipe(
+                        msgs = _build_messages(item, args.ev_limit,
+                                               no_think=args.no_think)
+                        pipe = model["pipeline"]
+                        raw  = pipe(
                             msgs,
                             max_new_tokens=args.max_tokens,
-                            temperature=args.temperature if do_sample else None,
-                            do_sample=do_sample,
-                            repetition_penalty=(
-                                args.repetition_penalty if do_sample else 1.0
-                            ),
+                            do_sample=False,
+                            temperature=None,
+                            repetition_penalty=1.0,
                             return_full_text=False,
                         )[0]["generated_text"].strip()
                         resps.append(_parse_response(raw, item.get("claim", "")))
