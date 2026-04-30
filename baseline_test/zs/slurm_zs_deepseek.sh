@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=cot-zs-deepseek
+#SBATCH --job-name=zs-deepseek
 #SBATCH --output=logs/slurm_zs_deepseek_%j.out
 #SBATCH --error=logs/slurm_zs_deepseek_%j.err
 #SBATCH --account=slurm-students
