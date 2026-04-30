@@ -1,40 +1,32 @@
 """
 LLM Fact-Check Evaluator
-Uses DeepSeek-R1-7B (or Llama-3.1-8B-Instruct / Qwen) via local HuggingFace model.
-Zero-shot Direct Prompting: Evidence + Claim -> JSON label via Logical Reasoner.
-
-Prompting strategy: Direct prompting (no explicit Chain-of-Thought steps in the
-prompt). DeepSeek R1 reasons internally via its <think> block by default; the
-system prompt states the task and JSON schema directly without coaching the model
-through numbered steps.
-
-Benchmark accuracy criteria (MedCalc-Bench §3.1, Table 2):
-  - Rule-based calculators (integer scores from summed criteria) : exact match
-  - Equation-based calculators (continuous decimal output)       : within 5%
-  - Date-based calculators (calendar date output)               : exact match
-
-The model self-classifies the calculator type from the claim and applies
-the correct criterion. No Category column is required in the dataset.
-
+Uses DeepSeek-R1-Distill-Qwen-7B via local HuggingFace model.
+Zero-shot Direct Prompting: Evidence + Claim -> free-text reasoning -> label via keyword extraction.
+ 
+Prompting strategy: Direct prompting — the system prompt states the task, label
+definitions, and accuracy rules directly. No step-by-step scaffolding, no JSON
+schema, no structured output format. DeepSeek R1 reasons internally via its
+<think> block; that block is stripped and the final label is extracted from the
+remaining free text using keyword matching.
+ 
 Output CSV columns:
   index | evidence | claim | true_label | predicted_label | match | model_reasoning | dataset_explanation
-
+ 
 Reproducibility controls:
-  - Always fp16 (4-bit quantization removed; consistent precision across GPUs)
+  - Always fp16 (consistent precision across same GPU architecture)
   - --batch-size defaults to 1 (eliminates padding-induced numerical drift)
   - FIXED_SEED = 42 hardcoded; seeds torch / random / numpy before any operation
-  - Greedy decoding (temperature=0, do_sample=False) is enforced throughout
+  - Greedy decoding (do_sample=False) is enforced throughout
   - torch.backends.cudnn.deterministic = True
-
+ 
 Install dependencies:
     pip install transformers torch
-
+ 
 Usage:
-    python zero_shot.py --data "mrt_claim_cleaned.csv" --model "$HOME/models/DeepSeek-R1-7B"
-    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct"
-    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
-    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
-    python zero_shot.py --data "train_300.csv"          --model "$HOME/models/Llama-3.1-8B-Instruct" --batch-size 1
+    python zero_shot.py --data "mrt_claim_cleaned.csv"
+    python zero_shot.py --data "mrt_claim_cleaned.csv" --samples 20 --random
+    python zero_shot.py --data "mrt_claim_cleaned.csv" --samples 0
+    python zero_shot.py --data "mrt_claim_cleaned.csv" --batch-size 1
 """
 
 import argparse
@@ -174,7 +166,7 @@ def load_model(model_name: str, batch_size: int) -> dict:
         print("  Loading in fp16 (deterministic across same GPU architecture)")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             low_cpu_mem_usage=True,
         )
@@ -182,7 +174,7 @@ def load_model(model_name: str, batch_size: int) -> dict:
         print("  No GPU — loading in fp32 on CPU")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             device_map="cpu",
             low_cpu_mem_usage=True,
         )
