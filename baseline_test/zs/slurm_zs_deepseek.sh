@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=cot-zs-deepseek
-#SBATCH --output=logs/slurm_cot_zs_deepseek_%j.out
-#SBATCH --error=logs/slurm_cot_zs_deepseek_%j.err
+#SBATCH --job-name=zs-deepseek
+#SBATCH --output=logs/slurm_zs_deepseek_%j.out
+#SBATCH --error=logs/slurm_zs_deepseek_%j.err
 #SBATCH --account=slurm-students
 #SBATCH --partition=gpu
 #SBATCH --mem=32G
