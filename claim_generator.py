@@ -304,7 +304,7 @@ def build_entity_explanation(key, true_value, claim_value, note, is_correct):
     claim_fmt = format_entity_value(key, claim_value)
     snippet = find_snippet_in_note(note, entity_value_to_search_str(true_value))
     note_ref = f' The patient note states {snippet}.' if snippet else \
-               ' This information is documented in the patient note.'
+               ' This information can be verified in the patient note.'
     if is_correct:
         return (f'The claim states the {key} is {claim_fmt}, which is correct.'
                 f'{note_ref}')
@@ -319,13 +319,11 @@ def build_calculation_explanation(claim_answer_str, gt_answer, gt_explanation,
    
     if output_type == 'date' or calc_id in RULE_BASED_CALC_IDS:
         if is_calc_correct:
-            return (f'The calculation result in the claim is {claim_answer_str}. '
-                    f'According to the {calc_name} formula, the claim\'s answer matches the correct result of {gt_fmt}, '
+            return (f'The calculation result in the claim is {claim_answer_str}, which matches the correct result of {gt_fmt}, '
                     f'so the calculation is correct.')
         else:
-            return (f'The calculation result in the claim is {claim_answer_str}. '
-                    f'According to the {calc_name} formula, the correct answer should be {gt_fmt}, but the claim states {claim_answer_str}, '
-                    f'which does not match the correct result, so the calculation is incorrect.')
+            return (f'The calculation result in the claim is {claim_answer_str}, which does not match the correct result of {gt_fmt}, '
+                    f'so the calculation is incorrect.')
 
     try:
         gt_val = float(gt_answer)
@@ -338,16 +336,12 @@ def build_calculation_explanation(claim_answer_str, gt_answer, gt_explanation,
 
     if is_calc_correct:
         pct_str = f' (difference: {pct_diff:.2f}%)' if pct_diff is not None else ''
-        return (f'The calculation result in the claim is {claim_answer_str}. '
-                f'According to the {calc_name} formula, the correct answer is {gt_fmt}. '
-                f'The claim\'s answer is within 5% of the correct result{pct_str}, '
+        return (f'The calculation result in the claim is {claim_answer_str}, which is within 5% of the correct result of {gt_fmt}{pct_str}, '
                 f'so the calculation is correct.')
     else:
         pct_str = f' (difference: {pct_diff:.2f}%, exceeding the 5% threshold)' \
                   if pct_diff is not None else ''
-        return (f'The calculation result in the claim is {claim_answer_str}. '
-                f'According to the {calc_name} formula, the correct answer is {gt_fmt}. '
-                f'The claim\'s answer deviates from the correct result{pct_str}, '
+        return (f'The calculation result in the claim is {claim_answer_str}, which deviates from the correct result of {gt_fmt}{pct_str}, '
                 f'so the calculation is incorrect.')
 
 
@@ -359,29 +353,39 @@ def build_explanation(true_entities, claim_entities, claim_str,
 
     lines = []
 
-    # Extractive Claim Verification
-    lines.append('Extractive Claim Verification:')
+    # step1_extracted_params
+    lines.append('step1_extracted_params:')
     for key, true_val in true_entities.items():
         claim_val = claim_entities.get(key, true_val)
         entity_correct = is_true or is_partially_true
         lines.append('- ' + build_entity_explanation(
             key, true_val, claim_val, note, entity_correct))
 
-    # Implicit Calculation Claim Verification
+    # step2_computed_value
     lines.append('')
-    lines.append('Implicit Calculation Claim Verification:')
+    lines.append('step2_computed_value:')
+
+    lines.append(f'{gt_explanation}')
 
     pattern = rf'the {re.escape(output_name)} is (.+?)\s*\.$'
     m = re.search(pattern, claim_str, re.IGNORECASE)
     claim_answer_str = m.group(1).strip() if m else '(unknown)'
 
     calc_correct = is_true
-    lines.append('- Conclusion: ' + build_calculation_explanation(
+    lines.append(build_calculation_explanation(
         claim_answer_str, gt_answer, gt_explanation,
         calc_name, output_type, calc_id, calc_correct
     ))
 
-    lines.append(f'- Ground Truth Explanation: {gt_explanation}')
+    # step3_verdict
+    lines.append('')
+    lines.append('step3_verdict:')
+    if is_true:
+        lines.append('All entities in step 1 are correct, and the computed value in step 2 is correct, so the final verdict is true.')
+    elif is_partially_true:
+        lines.append('All entities in step 1 are correct, but the computed value in step 2 is incorrect, so the final verdict is partially true.')
+    else:
+        lines.append('Not all entities in step 1 are correct, so the final verdict is false.')
 
     return '\n'.join(lines)
 
@@ -489,9 +493,7 @@ def main(input_path, output_path, cal_csv_path):
 
 if __name__ == '__main__':
     main(
-        input_path='medcalc_train_full.csv',
-        output_path='medcalc_train_claim_full.csv',
+        input_path='one_shot_data.csv',
+        output_path='one_shot_claims.csv',
         cal_csv_path='medcalc_cal_np.csv',
     )
-
-
