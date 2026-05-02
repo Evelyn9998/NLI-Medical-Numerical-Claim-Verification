@@ -304,7 +304,7 @@ def build_entity_explanation(key, true_value, claim_value, note, is_correct):
     claim_fmt = format_entity_value(key, claim_value)
     snippet = find_snippet_in_note(note, entity_value_to_search_str(true_value))
     note_ref = f' The patient note states {snippet}.' if snippet else \
-               ' This information is documented in the patient note.'
+               ' This information can be verified in the patient note.'
     if is_correct:
         return (f'The claim states the {key} is {claim_fmt}, which is correct.'
                 f'{note_ref}')
