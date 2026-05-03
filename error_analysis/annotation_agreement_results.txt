@@ -1,0 +1,133 @@
+========================================================================
+ANNOTATION AGREEMENT ANALYSIS — AGREED-POSITIVE SAMPLES
+★ = pure sample (only 1 agreed error type — best for few-shot)
+========================================================================
+
+■ failed parameter extraction  (n=10)
+     [2 types] idx=77    true=PARTIALLY TRUE   pred=False             [FEW-SHOT]
+     [3 types] idx=44    true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=68    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=18    true=True             pred=PARTIALLY TRUE    [VALIDATION]
+     [4 types] idx=54    true=True             pred=False           
+     [2 types] idx=38    true=PARTIALLY TRUE   pred=False             [FEW-SHOT]
+     [3 types] idx=131   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=52    true=False            pred=PARTIALLY TRUE    [VALIDATION]
+     [3 types] idx=30    true=True             pred=False           
+     [3 types] idx=9     true=True             pred=False             [VALIDATION]
+
+■ verification logic errors  (n=36)
+     [3 types] idx=44    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=98    true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=75    true=True             pred=False           
+     [2 types] idx=118   true=False            pred=PARTIALLY TRUE  
+     [3 types] idx=83    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=141   true=True             pred=False           
+     [2 types] idx=69    true=True             pred=PARTIALLY TRUE  
+   ★ idx=151   true=False            pred=PARTIALLY TRUE    [FEW-SHOT]
+     [3 types] idx=113   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=29    true=PARTIALLY TRUE   pred=True            
+   ★ idx=11    true=PARTIALLY TRUE   pred=False             [FEW-SHOT]
+   ★ idx=36    true=True             pred=False             [FEW-SHOT]
+     [3 types] idx=57    true=True             pred=False             [FEW-SHOT]
+     [3 types] idx=116   true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=119   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=134   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=61    true=False            pred=PARTIALLY TRUE  
+     [3 types] idx=27    true=True             pred=False           
+     [3 types] idx=117   true=True             pred=False           
+     [3 types] idx=120   true=True             pred=False           
+     [2 types] idx=62    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=132   true=True             pred=False           
+     [2 types] idx=121   true=False            pred=PARTIALLY TRUE  
+     [2 types] idx=79    true=False            pred=PARTIALLY TRUE  
+     [2 types] idx=33    true=True             pred=False           
+     [3 types] idx=84    true=True             pred=False           
+     [3 types] idx=68    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=137   true=PARTIALLY TRUE   pred=False           
+     [4 types] idx=54    true=True             pred=False           
+     [2 types] idx=38    true=PARTIALLY TRUE   pred=False             [FEW-SHOT]
+     [3 types] idx=131   true=PARTIALLY TRUE   pred=False           
+   ★ idx=95    true=PARTIALLY TRUE   pred=False             [VALIDATION]
+     [3 types] idx=30    true=True             pred=False           
+   ★ idx=50    true=PARTIALLY TRUE   pred=False             [VALIDATION]
+     [3 types] idx=9     true=True             pred=False             [VALIDATION]
+     [2 types] idx=74    true=PARTIALLY TRUE   pred=False             [VALIDATION]
+
+■ incorrect formula & criteria application  (n=29)
+     [3 types] idx=44    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=98    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=123   true=True             pred=PARTIALLY TRUE    [FEW-SHOT]
+     [2 types] idx=53    true=PARTIALLY TRUE   pred=True              [VALIDATION]
+     [3 types] idx=75    true=True             pred=False           
+   ★ idx=26    true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=83    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=141   true=True             pred=False           
+     [3 types] idx=113   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=29    true=PARTIALLY TRUE   pred=True            
+     [3 types] idx=57    true=True             pred=False             [FEW-SHOT]
+     [3 types] idx=116   true=PARTIALLY TRUE   pred=False           
+   ★ idx=32    true=PARTIALLY TRUE   pred=True              [FEW-SHOT]
+     [3 types] idx=119   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=134   true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=61    true=False            pred=PARTIALLY TRUE  
+     [3 types] idx=27    true=True             pred=False           
+     [3 types] idx=117   true=True             pred=False           
+     [3 types] idx=120   true=True             pred=False           
+     [2 types] idx=62    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=132   true=True             pred=False           
+   ★ idx=23    true=PARTIALLY TRUE   pred=True              [FEW-SHOT]
+     [2 types] idx=33    true=True             pred=False           
+     [3 types] idx=84    true=True             pred=False           
+     [2 types] idx=137   true=PARTIALLY TRUE   pred=False           
+     [4 types] idx=54    true=True             pred=False           
+     [3 types] idx=131   true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=30    true=True             pred=False           
+   ★ idx=35    true=PARTIALLY TRUE   pred=True              [VALIDATION]
+
+■ computation errors  (n=15)
+     [2 types] idx=123   true=True             pred=PARTIALLY TRUE    [FEW-SHOT]
+     [2 types] idx=53    true=PARTIALLY TRUE   pred=True              [VALIDATION]
+     [3 types] idx=75    true=True             pred=False           
+     [3 types] idx=83    true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=113   true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=57    true=True             pred=False             [FEW-SHOT]
+   ★ idx=89    true=PARTIALLY TRUE   pred=True              [FEW-SHOT]
+     [3 types] idx=116   true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=119   true=PARTIALLY TRUE   pred=False           
+     [3 types] idx=27    true=True             pred=False           
+     [3 types] idx=117   true=True             pred=False           
+     [3 types] idx=120   true=True             pred=False           
+     [3 types] idx=84    true=True             pred=False           
+     [4 types] idx=54    true=True             pred=False           
+     [2 types] idx=74    true=PARTIALLY TRUE   pred=False             [VALIDATION]
+
+■ omitting the calculation process or result  (n=11)
+     [2 types] idx=77    true=PARTIALLY TRUE   pred=False             [FEW-SHOT]
+   ★ idx=2     true=PARTIALLY TRUE   pred=True              [FEW-SHOT]
+     [2 types] idx=118   true=False            pred=PARTIALLY TRUE  
+     [2 types] idx=69    true=True             pred=PARTIALLY TRUE  
+     [2 types] idx=121   true=False            pred=PARTIALLY TRUE  
+     [2 types] idx=79    true=False            pred=PARTIALLY TRUE  
+   ★ idx=86    true=PARTIALLY TRUE   pred=True              [VALIDATION]
+     [3 types] idx=68    true=PARTIALLY TRUE   pred=False           
+     [2 types] idx=18    true=True             pred=PARTIALLY TRUE    [VALIDATION]
+     [2 types] idx=52    true=False            pred=PARTIALLY TRUE    [VALIDATION]
+     [3 types] idx=9     true=True             pred=False             [VALIDATION]
+
+■ other errors  (n=1)
+   ★ idx=14    true=PARTIALLY TRUE   pred=UNKNOWN           [FEW-SHOT]
+
+========================================================================
+RECOMMENDED FEW-SHOT & VALIDATION SPLIT
+========================================================================
+  Error Type                                      Few-shot              Validation
+  --------------------------------------------------------------------------------
+  failed parameter extraction                     idx=77, 38            idx=18, 52
+  verification logic errors                       idx=151, 11, 36       idx=95, 50
+  incorrect formula & criteria application        idx=57, 32, 23        idx=35
+  computation errors                              idx=123, 89           idx=53
+  omitting the calculation process or result      idx=2                 idx=74, 86, 9
+  other errors                                    idx=14                (none)
+
+  Total few-shot  : 12 samples  (indices: [2, 11, 14, 23, 32, 36, 38, 57, 77, 89, 123, 151])
+  Total validation: 9 samples  (indices: [9, 18, 35, 50, 52, 53, 74, 86, 95])
