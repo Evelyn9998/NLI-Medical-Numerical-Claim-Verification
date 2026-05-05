@@ -6,8 +6,8 @@ tags "pure" samples (only 1 agreed error type — best for few-shot),
 and prints a summary with annotation snippets from both annotators.
 
 Input files:
-  error_analysis_50_wt_1.xlsx      — WT binary labels
-  error_analysis_50_Evelyn_1.xlsx  — Evelyn binary labels
+  error_analysis_50_wt_2.xlsx      — WT binary labels
+  error_analysis_50_Evelyn_2.xlsx  — Evelyn binary labels
 
 Output:
   annotation_agreement_results.txt — full results saved to file
@@ -31,16 +31,16 @@ ERROR_COLS = [
     'other errors',
 ]
 
-FEW_SHOT_INDICES   = {77, 38, 151, 11, 36, 57, 32, 23, 123, 89, 2, 14}
-VALIDATION_INDICES = {18, 52, 95, 50, 35, 53, 74, 86, 9}
+FEW_SHOT_INDICES   = {77, 38, 151, 11, 36, 57, 32, 23, 84, 54, 2, 14}
+VALIDATION_INDICES = {18, 52, 95, 50, 35, 53, 83, 86, 9}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     # Load labels
-    df_wt = pd.read_excel('error_analysis_50_wt_1.xlsx').set_index('index')
-    df_ev = pd.read_excel('error_analysis_50_Evelyn_1.xlsx').set_index('index')
+    df_wt = pd.read_excel('error_analysis_50_wt_2.xlsx').set_index('index')
+    df_ev = pd.read_excel('error_analysis_50_Evelyn_2.xlsx').set_index('index')
 
     # Find agreed-positive samples per error type
     def get_agreed_types(idx):
@@ -95,8 +95,8 @@ def main():
         ('failed parameter extraction',               'idx=77, 38',      'idx=18, 52'),
         ('verification logic errors',                 'idx=151, 11, 36', 'idx=95, 50'),
         ('incorrect formula & criteria application',  'idx=57, 32, 23',  'idx=35'),
-        ('computation errors',                        'idx=123, 89',     'idx=53'),
-        ('omitting the calculation process or result','idx=2',           'idx=74, 86, 9'),
+        ('computation errors',                        'idx=84, 54',      'idx=53, 83'),
+        ('omitting the calculation process or result','idx=2',           'idx=86, 9'),
         ('other errors',                              'idx=14',          '(none)'),
     ]
     lines.append(f'  {"Error Type":<46}  {"Few-shot":<20}  Validation')

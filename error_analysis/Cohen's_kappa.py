@@ -2,7 +2,7 @@
 Inter-Annotator Agreement Analysis
 ===================================
 Computes per-error-type counts, agreement statistics, and Cohen's kappa
-for two annotators (wt and Evelyn) on the Llama-3.1-8B-Instruct error analysis dataset.
+for two annotators (ANN1-wt and ANN2-Evelyn) on the Llama-3.1-8B-Instruct error analysis dataset.
 
 Dependencies:
     pip install pandas openpyxl scikit-learn numpy
@@ -18,8 +18,8 @@ from openpyxl.utils import get_column_letter
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-FILE_WT     = "error_analysis_50_wt_1.xlsx"
-FILE_EVELYN = "error_analysis_50_Evelyn_1.xlsx"
+FILE_WT     = "error_analysis_50_wt_2.xlsx"
+FILE_EVELYN = "error_analysis_50_Evelyn_2.xlsx"
 OUTPUT_FILE = "Cohen's_kappa_result.xlsx"
 
 ANN_COLS = [
