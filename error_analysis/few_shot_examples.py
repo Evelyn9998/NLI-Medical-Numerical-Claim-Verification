@@ -11,7 +11,7 @@ Sample allocation
 Type 1 – failed_parameter_extraction          : idx 77, 38
 Type 2 – verification_logic_error             : idx 151, 11, 36
 Type 3 – incorrect_formula_criteria           : idx 57, 32, 23
-Type 4 – computation_error                    : idx 123, 89
+Type 4 – computation_error                    : idx 84, 54
 Type 5 – omitted_calculation_process_or_result: idx 2
 Type 6 – other_error                          : idx 14
 """
@@ -97,9 +97,11 @@ FEW_SHOT_EXAMPLES = [
                 "Date (11/16/2007 vs actual 01/24/2008) and the Last menstrual date (02/02/2008 vs "
                 "actual 10/16/2007). Under dataset rules, any incorrect input entity means the label "
                 "must be 'false'. The LLM instead applied 'partially true' because the approximate "
-                "date difference happened to match the gestational age claim. The LLM failed to follow "
-                "the correct labelling logic: even though the parameter extraction is wrong, it still "
-                "wrongly verdicted the claim as 'partially true'."
+                "date difference happened to match the gestational age claim. "
+                "The LLM correctly identified that both input entities were wrong, "
+                "but failed to apply the labelling rule: any incorrect input entity "
+                "must yield 'false', regardless of whether the derived result appears "
+                "to coincidentally match."
             ),
         },
     },
@@ -125,8 +127,8 @@ FEW_SHOT_EXAMPLES = [
                 "extracted. The LLM computes MAP=90 using the standard formula, sees it differs from "
                 "the claim value of 72.5478, and labels the claim 'false'. However, since all input "
                 "entities are correct and only the final result differs, the correct label is "
-                "'partially true'. The LLM failed to follow the logic of 'partially true' in the "
-                "prompt — it did not extract and verify input parameters first before issuing a verdict."
+                "'partially true' — the LLM correctly extracted all input parameters but failed "
+                "to apply this labelling rule."
             ),
         },
     },
@@ -149,11 +151,10 @@ FEW_SHOT_EXAMPLES = [
             "other_error": 0,
             "explanation": (
                 "verification_logic_error: All input entities are correctly extractable from the "
-                "evidence. The LLM made a qualitative judgment based on 'likely' risk rather than "
-                "applying the Revised Cardiac Risk Index (RCRI) formula, and labelled the claim "
-                "'false' without performing the actual score calculation. The LLM lacked knowledge "
-                "of RCRI criteria and failed to follow the 'partially true' logic in the prompt — "
-                "it did not extract and verify each parameter first before issuing a verdict."
+                "evidence. The LLM made a qualitative judgment based on 'likely' risk and labelled "
+                "the claim 'false' without applying the RCRI formula — failing to follow the "
+                "prescribed verification process of extracting and confirming each input parameter "
+                "before calculating the score."
             ),
         },
     },
@@ -181,9 +182,11 @@ FEW_SHOT_EXAMPLES = [
                 "is 0.03 (Cortisone is 25mg-equivalent; Betamethasone is 0.75mg-equivalent per "
                 "standard steroid equivalence tables). This produced 404.47 mg instead of the "
                 "correct ~7.83 mg. "
-                "verification_logic_error: Because the LLM's computed value (404.47 mg) was vastly "
-                "different from the claim (7.83 mg), it labelled the claim 'false' without "
-                "recognising that all input parameters were correctly extracted."
+                "verification_logic_error: The LLM saw a discrepancy between its own computed value "
+                "(404.47 mg) and the claim (7.8299 mg), and immediately labelled the claim 'false' — "
+                "without considering that the discrepancy could stem from its own wrong formula. "
+                "Since all input parameters are correctly stated, the label should be at least "
+                "'partially true'."
             ),
         },
     },
@@ -208,10 +211,7 @@ FEW_SHOT_EXAMPLES = [
                 "incorrect_formula_criteria: The LLM uses an incorrect Wells DVT scoring rule. "
                 "It applies -2 points for each criterion that is not present, which is not part of "
                 "the standard Wells DVT scoring system. The correct rule assigns 0 for absent "
-                "criteria and +1 for each present criterion (with -2 only for 'alternative diagnosis "
-                "as likely or more likely'). The LLM also wrongly subtracts points for non-existent "
-                "entities. Using the correct criteria, the score should be +1 (major surgery within "
-                "12 weeks: yes) - 2 (alternative diagnosis likely: yes) = -1, not -2."
+                "criteria and +1 for each present criterion."
             ),
         },
     },
@@ -244,59 +244,114 @@ FEW_SHOT_EXAMPLES = [
         },
     },
 
-    # ── Type 4: computation_error | idx=123 ───────────────────────────────────
+    # ── Type 4: computation_error | idx=84 ────────────────────────────────────
     {
-        "index": 123,
+        "index": 84,
         "primary_type": "computation errors",
         "true_label": "true",
-        "predicted_label": "partially true",
-        "claim": "Based on the patient's data where the Heart Rate or Pulse is 139 beats per minute, the QT Interval is 468 msec, the Corrected QT Interval is 673.4 msec.",
-        "evidence": "A patient has a heart rate of 139 bpm and a QT interval of 468 msec.",
-        "model_reasoning": "To determine the correctness of the claim, we need to calculate the Corrected QT Interval (QTc) using the Bazett's formula: QTc = QT / sqrt(RR), where RR is the interval between heartbeats in seconds. Given the heart rate of 139 bpm, the RR interval is 1/139 seconds. First, convert the RR interval to seconds: 1/139 approximately 0.00718 seconds. Then, calculate the QTc: QTc = 468 / sqrt(0.00718) approximately 468 / 0.084 approximately 5571.43 / 8.3 approximately 671.7 msec. However, the claim states the QTc is 673.4 msec, which is close but not exactly equal to our calculated value.",
+        "predicted_label": "false",
+        "claim": "Based on the patient's data where the age is 72 years, the weight is 62.0 kg, the sex is Female, the Sodium is 144.0 mEq/L, the Free Body Water Deficit is 0.7971 L.",
+        "evidence": (
+            "A 72-year-old woman was admitted to our hospital for surgery for esophageal cancer. "
+            "At admission, her blood pressure was 120/70 mmHg and pulse rate was 76 beats per minute. "
+            "She was 152 cm in height and weighted 62 Kg. Physical examination was unremarkable. "
+            "Preoperatively, renal function was moderately decreased (creatinine, 0.95 mg/dL, "
+            "blood urea nitrogen: 16.5 mg/dL, uric acid: 5.7 mg/dL, sodium: 144 mEq/L, "
+            "potassium: 4.1 mEq/L, chloride 110 mEq/L, phosphorus 3.7 mg/dL). "
+            "During the thoracoscopic esophagectomy, blood loss was 460 ml, and hemodynamics were stable."
+        ),
+        "model_reasoning": (
+            "To determine if the claim is true, we need to calculate the free body water (FBW) and "
+            "then the free body water deficit. The formula for calculating FBW is: FBW (L) = "
+            "0.58 × weight (kg) for men and 0.49 × weight (kg) for women. Given the patient's "
+            "weight is 62 kg and sex is female, we use the female formula. FBW = 0.49 × 62 kg = "
+            "30.38 L. The free body water deficit can be calculated using the formula: "
+            "Free Body Water Deficit (L) = (0.6 × weight (kg)) / (0.9 × sodium (mEq/L)). "
+            "Given the patient's weight is 62 kg and sodium is 144 mEq/L, we can calculate the "
+            "free body water deficit. Free Body Water Deficit = (0.6 × 62 kg) / (0.9 × 144 mEq/L) "
+            "= 0.6 × 62 kg / 129.6 = 2.34 L. However, the claim states the free body water deficit "
+            "is 0.7971 L, which is not consistent with the calculated value."
+        ),
         "annotation": {
             "failed_parameter_extraction": 0,
-            "verification_logic_error": 0,
+            "verification_logic_error": 1,
             "incorrect_formula_criteria": 1,
             "computation_error": 1,
             "omitted_calculation_process_or_result": 0,
             "other_error": 0,
             "explanation": (
-                "computation_error: The LLM makes multiple arithmetic errors. "
-                "1/139 = 0.00719, not 0.00718. "
-                "5571.43 / 8.3 = 671.25662651, not 671.7. "
-                "These errors produce a result that diverges from the correct value (673.4 msec), "
-                "causing the LLM to incorrectly label the claim as 'partially true'. "
-                "incorrect_formula_criteria: The LLM selects Bazett's formula (QTc = QT / sqrt(RR)) "
-                "instead of the formula used by the dataset to derive the ground-truth value of "
-                "673.4 msec. Different QTc formulas (Bazett, Fridericia, Framingham) produce "
-                "different results for the same inputs."
+                "computation_error: The LLM applies a wrong formula and also makes an arithmetic "
+                "error within it: (0.6 × 62) / (0.9 × 144) = 37.2 / 129.6 ≈ 0.287 L, not 2.34 L "
+                "as the LLM states. Its stated result (2.34 L) deviates from the correct value "
+                "(0.7971 L) by ~193%, far exceeding the 5% tolerance for equation-based calculators. "
+                "incorrect_formula_criteria: The correct formula is TBW% × weight × (Na/140 − 1), "
+                "where TBW% = 0.45 for elderly females (age > 64). The LLM instead applies "
+                "(0.6 × weight) / (0.9 × sodium), which is not a recognised Free Water Deficit "
+                "formula, and uses the adult-female coefficient (0.49) rather than the elderly-female "
+                "value (0.45). "
+                "verification_logic_error: The LLM skips entity-by-entity verification of input "
+                "parameters (age, weight, sex, sodium) against the evidence before calculating, "
+                "then labels the claim 'false' despite all inputs being correctly stated."
             ),
         },
     },
 
-    # ── Type 4: computation_error | idx=89 ────────────────────────────────────
+    # ── Type 4: computation_error | idx=54 ────────────────────────────────────
     {
-        "index": 89,
+        "index": 54,
         "primary_type": "computation errors",
-        "true_label": "partially true",
-        "predicted_label": "true",
-        "claim": "Based on the patient's data where the creatinine is 0.25 mg/dL, the Urine sodium is 16.0 mmol/L, the Urine creatinine is 6.8 mg/dL, the Sodium is 123.0 mmol/L, the FEna Percentage is 0.4165 %.",
-        "evidence": "A 50-year-old male visited our emergency room(ER) because of generalized edema. He appeared remarkably swollen during the past week, with associated reduced urine output. Laboratory data showed serum creatinine 0.25 mg/dL. Serum sodium was 123.0 mmol/L. Urine sodium was 16.0 mmol/L. Urine creatinine was 6.8 mg/dL.",
-        "model_reasoning": "To determine the validity of the claim, we need to calculate the fractional excretion of sodium (FEna) using the formula: FEna = (Urine sodium / Serum sodium) / (Urine creatinine / Serum creatinine) * 100. Given the values, FEna = (16.0 / 123.0) / (6.8 / 0.25) * 100 = 0.4165%. This calculation matches the provided FEna percentage, indicating that the claim is accurate.",
+        "true_label": "true",
+        "predicted_label": "false",
+        "claim": (
+            "Based on the patient's data where the creatinine is 2.0 mg/dL, "
+            "the Continuous veno-venous hemodialysis for ≥24 hours in the past week is no, "
+            "the Dialysis at least twice in the past week is no, "
+            "the international normalized ratio is 1.59, the Sodium is 142.0 mEq/L, "
+            "the Bilirubin is 0.7 mg/dL, the MELD Na Score is 18.0."
+        ),
+        "evidence": (
+            "A 57-year-old man with a history of hypertension and right hip fracture called "
+            "emergency medical services and complained of severe leg pain. "
+            "Initial investigations showed blood urea nitrogen 29 mg/dL, creatinine 2.0 mg/dL, "
+            "sodium 142 mEq/L, potassium 3.9 mEq/L, lactic acid 4.25 mmol/L. "
+            "The liver function test demonstrated total bilirubin 0.7 mg/dL, "
+            "total protein 6.2 gm/dL, and albumin 3.5 mg/dL. "
+            "Coagulogram showed prothrombin time 17.5 seconds, partial thromboplastin time "
+            "25.8 seconds, and international normalized ratio 1.59. "
+            "No dialysis was performed during admission."
+        ),
+        "model_reasoning": (
+            "The MELD Na Score is calculated using the formula: "
+            "4.43 * log(e)(bilirubin mg/dL) + 10.36 * log(e)(INR) + 3.78 * log(e)(Na mEq/L) + 1.18. "
+            "Given the values: bilirubin = 0.7 mg/dL, INR = 1.59, and Na = 142 mEq/L, "
+            "we can calculate the MELD Na Score as follows: "
+            "4.43 * log(e)(0.7) + 10.36 * log(e)(1.59) + 3.78 * log(e)(142) + 1.18. "
+            "This calculation results in a MELD Na Score of approximately 9.3, not 18.0. "
+            "Therefore, the claim that the MELD Na Score is 18.0 is false."
+        ),
         "annotation": {
-            "failed_parameter_extraction": 0,
-            "verification_logic_error": 0,
-            "incorrect_formula_criteria": 0,
+            "failed_parameter_extraction": 1,
+            "verification_logic_error": 1,
+            "incorrect_formula_criteria": 1,
             "computation_error": 1,
             "omitted_calculation_process_or_result": 0,
             "other_error": 0,
             "explanation": (
-                "computation_error: The LLM's formula is correct "
-                "(FEna = (UNa / SNa) / (UCr / SCr) x 100), and all input values are correctly "
-                "extracted, but the arithmetic is wrong. "
-                "Correct calculation: (16.0 / 123.0) / (6.8 / 0.25) x 100 = 0.4782%, not 0.4165%. "
-                "The LLM incorrectly confirmed 0.4165% as accurate and labelled the claim 'true', "
-                "when the correct label is 'partially true' because the claimed FEna value is wrong."
+                "computation_error: The LLM's own formula evaluates to ~23.14, not 9.3 — an "
+                "additional arithmetic error. Its stated result (9.3) deviates from the correct "
+                "value (18.0) by ~48%, far exceeding the 5% tolerance for equation-based calculators. "
+                "incorrect_formula_criteria: The LLM applies an incorrect MELD Na formula that omits "
+                "creatinine entirely. The correct two-step UNOS/OPTN formula is: "
+                "MELD(i) = 0.957 × ln(Cr) + 0.378 × ln(bilirubin) + 1.120 × ln(INR) + 0.643; "
+                "if MELD(i) × 10 > 11, then MELD = MELD(i) + 1.32 × (137 − Na) − "
+                "[0.033 × MELD(i) × (137 − Na)], with Na clamped to [125, 137] and bilirubin "
+                "floored at 1.0. "
+                "failed_parameter_extraction: The LLM omits creatinine from its formula and ignores "
+                "the two dialysis conditions (CVVHD ≥24 h and dialysis ≥2× per week), which are "
+                "required inputs for the MELD Na calculation. "
+                "verification_logic_error: The LLM skips entity verification and directly computes "
+                "the score, labelling the claim 'false' despite all input entities being correctly "
+                "stated — the correct label would be 'partially true' if the computation were wrong."
             ),
         },
     },
@@ -322,8 +377,7 @@ FEW_SHOT_EXAMPLES = [
                 "formula to compute Creatinine Clearance. Instead, it verified that the listed input "
                 "parameters (sex, age, weight, height, creatinine) were consistent with the evidence, "
                 "then accepted the claim's stated CrCl value (5.225 mL/min) as accurate without "
-                "performing the calculation. The correct calculation yields a different value, making "
-                "the claim 'partially true', not 'true'."
+                "performing the calculation."
             ),
         },
     },
