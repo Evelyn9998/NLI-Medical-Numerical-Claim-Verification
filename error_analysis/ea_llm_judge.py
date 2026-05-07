@@ -1,23 +1,25 @@
 """
-LLM-as-Judge Error Classifier — Few-shot with OpenAI API
-=========================================================
+LLM-as-Judge Error Classifier — Few-shot with OpenAI-compatible API
+====================================================================
 Uses 12 human-validated few-shot examples to classify error types
-for all remaining incorrect predictions.
+for all remaining incorrect predictions. Supports OpenAI and DeepSeek.
 
 Usage:
     pip install openai
 
-    # Validation set quick test
-    python error_analysis_fewshot_api.py --data ../results/zs_cot/zs_cot_llama_full.csv --samples 9
+    # Validation set quick test (OpenAI)
+    python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv --samples 9
 
     # Run with GPT-4o
-    python error_analysis_fewshot_api.py --data ../results/zs_cot/zs_cot_llama_full.csv --model gpt-4o
+    python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv --model gpt-4o
 
-    # Run with GPT-4o-mini
-    python error_analysis_fewshot_api.py --data ../results/zs_cot/zs_cot_llama_full.csv --model gpt-4o-mini
+    # Run with DeepSeek (set DEEPSEEK_API_KEY or pass --api-key)
+    python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv \
+        --model deepseek-v4-pro --base-url https://api.deepseek.com
 
     # Full run, skip held-out validation set (indices: 18,52,95,50,35,53,74,86,9)
-    python error_analysis_fewshot_api.py --data ../results/zs_cot/zs_cot_llama_full.csv --model gpt-4o --skip-validation
+    python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv \
+        --model deepseek-v4-pro --base-url https://api.deepseek.com --skip-validation
 """
 
 import argparse
@@ -212,36 +214,59 @@ def load_errors(csv_path: str, skip_indices: set) -> list:
     return rows
 
 
-def call_api(client, model: str, user_content: str) -> str:
+def call_api(client, model: str, user_content: str,
+             debug: bool = False, extra_body: dict = None,
+             max_tokens: int = 600) -> str:
     msg = client.chat.completions.create(
         model=model,
-        max_tokens=400,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_content},
         ],
+        **({"extra_body": extra_body} if extra_body else {}),
     )
-    return msg.choices[0].message.content
+    raw = msg.choices[0].message.content or ""
+    if debug:
+        print(f"\n[DEBUG raw response]\n{raw}\n[/DEBUG]\n")
+    return raw
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data",            default="validation_set.csv")
-    parser.add_argument("--api-key",         default=os.environ.get("OPENAI_API_KEY", ""))
+    parser.add_argument("--api-key",         default=os.environ.get("OPENAI_API_KEY")
+                                                              or os.environ.get("DEEPSEEK_API_KEY", ""))
     parser.add_argument("--model",           default="gpt-4o")
+    parser.add_argument("--base-url",        default="",
+                        help="API base URL (e.g. https://api.deepseek.com for DeepSeek)")
     parser.add_argument("--samples",          type=int, default=0)
     parser.add_argument("--skip-validation",  action="store_true",
                         help="Exclude held-out validation indices from processing")
     parser.add_argument("--validation-only",  action="store_true",
                         help="Run ONLY the 9 held-out validation indices")
     parser.add_argument("--output",           default="")
+    parser.add_argument("--debug",            action="store_true",
+                        help="Print raw API response for each sample")
     args = parser.parse_args()
 
     if not args.api_key:
-        print("Set OPENAI_API_KEY or pass --api-key")
+        print("Set OPENAI_API_KEY / DEEPSEEK_API_KEY or pass --api-key")
         sys.exit(1)
 
-    client = openai.OpenAI(api_key=args.api_key)
+    client = openai.OpenAI(
+        api_key=args.api_key,
+        **({"base_url": args.base_url} if args.base_url else {}),
+    )
+    is_reasoner = "reasoner" in args.model.lower()
+    if args.base_url and not is_reasoner:
+        # Non-reasoner DeepSeek models default to thinking mode, which exhausts
+        # max_tokens before producing content. Disable it for direct JSON output.
+        extra_body = {"thinking": {"type": "disabled"}}
+        max_tokens = 600
+    else:
+        extra_body = None
+        max_tokens = 4000  # reasoner needs tokens for both thinking and output
     print(f"Model: {args.model}")
 
     few_shot_indices = {ex["index"] for ex in FEW_SHOT_EXAMPLES}
@@ -280,7 +305,9 @@ def main():
         for attempt in range(3):
             try:
                 raw = call_api(client, args.model,
-                               build_user_message(row, few_shot_block))
+                               build_user_message(row, few_shot_block),
+                               debug=args.debug, extra_body=extra_body,
+                               max_tokens=max_tokens)
                 res = parse_response(raw)
                 break
             except Exception as e:

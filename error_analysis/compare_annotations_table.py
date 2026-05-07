@@ -19,6 +19,7 @@ Usage:
 import argparse
 import csv
 import os
+import re
 import sys
 
 import openpyxl
@@ -104,7 +105,7 @@ def load_predictions(csv_path: str):
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
-def build_excel(idxs, gt_wt, gt_ev, preds, meta, out_path):
+def build_excel(idxs, gt_wt, gt_ev, preds, meta, out_path, model_label="GPT-4o"):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Annotation Comparison"
@@ -142,7 +143,7 @@ def build_excel(idxs, gt_wt, gt_ev, preds, meta, out_path):
         ws.cell(2, col).alignment = CENTER
 
     for i in range(n_types):
-        for j, name in enumerate(["WT", "Evelyn", "GPT-4o"]):
+        for j, name in enumerate(["WT", "Evelyn", model_label]):
             c = ws.cell(2, fixed + i * 3 + 1 + j, name)
             c.fill      = SUBHDR
             c.font      = BOLD_DARK
@@ -199,7 +200,7 @@ def build_excel(idxs, gt_wt, gt_ev, preds, meta, out_path):
         ("Color",    "Meaning"),
         ("Green",    "Value = 1 (error annotated), all three agree"),
         ("White",    "Value = 0 (not annotated), all three agree"),
-        ("Orange",   "Disagreement among WT / Evelyn / GPT-4o"),
+        (f"Orange",  f"Disagreement among WT / Evelyn / {model_label}"),
     ]
     for i, (k, v) in enumerate(legend_data, 1):
         lg.cell(i, 1, k).font = Font(bold=(i == 1))
@@ -226,11 +227,12 @@ def build_excel(idxs, gt_wt, gt_ev, preds, meta, out_path):
 
 # ── CSV builder ────────────────────────────────────────────────────────────────
 
-def build_csv(idxs, gt_wt, gt_ev, preds, meta, out_path):
+def build_csv(idxs, gt_wt, gt_ev, preds, meta, out_path, model_label="GPT-4o"):
     n_types = len(TYPES)
     header = ["index", "true_label", "pred_label"]
     for s, (t, _, _) in zip(SHORT_LABELS, TYPES):
-        header += [f"{s}_WT", f"{s}_Evelyn", f"{s}_GPT4o"]
+        label_slug = model_label.replace("-", "").replace(" ", "_")
+        header += [f"{s}_WT", f"{s}_Evelyn", f"{s}_{label_slug}"]
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -247,7 +249,7 @@ def build_csv(idxs, gt_wt, gt_ev, preds, meta, out_path):
 
 # ── Terminal table ────────────────────────────────────────────────────────────
 
-def print_terminal(idxs, gt_wt, gt_ev, preds, meta):
+def print_terminal(idxs, gt_wt, gt_ev, preds, meta, model_label="GPT-4o"):
     n_types = len(TYPES)
     # Header
     header1 = f"{'idx':>4}  {'True':>11}  {'Pred':>11}  "
@@ -277,7 +279,7 @@ def print_terminal(idxs, gt_wt, gt_ev, preds, meta):
         print(row)
 
     print(sep)
-    print("\nLegend:  W=WT  E=Evelyn  G=GPT-4o  1=annotated  ·=not annotated  *=disagreement")
+    print(f"\nLegend:  W=WT  E=Evelyn  G={model_label}  1=annotated  ·=not annotated  *=disagreement")
     print("Types:   " + "  ".join(f"{s}={t[:20]}" for s, (t, _, _) in zip(SHORT_LABELS, TYPES)))
     print()
 
@@ -290,6 +292,8 @@ def main():
     parser.add_argument("--gt",   default="error_analysis_common_agree.xlsx")
     parser.add_argument("--out",  default="annotation_comparison",
                         help="Output file base name (no extension)")
+    parser.add_argument("--model-name", default="",
+                        help="Model label shown in output (auto-detected from filename if omitted)")
     args = parser.parse_args()
 
     for p in (args.pred, args.gt):
@@ -297,19 +301,26 @@ def main():
             print(f"File not found: {p}")
             sys.exit(1)
 
+    stem = os.path.splitext(os.path.basename(args.pred))[0]
+    m = re.match(r"error_fewshot_(.+?)_\d{8}_\d{6}$", stem)
+    model_label = args.model_name or (m.group(1) if m else stem)
+
+    if args.out == "annotation_comparison":
+        args.out = f"annotation_comparison_{model_label}"
+
     preds, meta = load_predictions(args.pred)
     gt_wt, gt_ev = load_gt(args.gt, valid_indices=set(preds.keys()))
 
     idxs = sorted(set(preds.keys()) & set(gt_wt.keys()))
     print(f"\nSamples: {len(idxs)}")
 
-    print_terminal(idxs, gt_wt, gt_ev, preds, meta)
+    print_terminal(idxs, gt_wt, gt_ev, preds, meta, model_label)
 
     out_dir = os.path.dirname(args.pred) or "."
     build_excel(idxs, gt_wt, gt_ev, preds, meta,
-                os.path.join(out_dir, args.out + ".xlsx"))
+                os.path.join(out_dir, args.out + ".xlsx"), model_label)
     build_csv(   idxs, gt_wt, gt_ev, preds, meta,
-                os.path.join(out_dir, args.out + ".csv"))
+                os.path.join(out_dir, args.out + ".csv"), model_label)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ Usage:
 import argparse
 import csv
 import os
+import re
 import sys
 
 import openpyxl
@@ -173,10 +174,16 @@ def print_tables(results: dict):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred", required=True,
-                        help="Prediction CSV (output of error_analysis_fewshot_api.py)")
+                        help="Prediction CSV (output of ea_llm_judge.py)")
     parser.add_argument("--gt",   default="error_analysis_common_agree.xlsx",
                         help="Ground truth xlsx (default: error_analysis_common_agree.xlsx)")
+    parser.add_argument("--model-name", default="",
+                        help="Model label shown in output (auto-detected from filename if omitted)")
     args = parser.parse_args()
+
+    stem = os.path.splitext(os.path.basename(args.pred))[0]
+    m = re.match(r"error_fewshot_(.+?)_\d{8}_\d{6}$", stem)
+    model_label = args.model_name or (m.group(1) if m else stem)
 
     for path in (args.pred, args.gt):
         if not os.path.exists(path):
@@ -192,9 +199,9 @@ def main():
     print(f"Samples in pred : {len(preds)}  |  matched in GT: {len(gt_agree)}")
 
     results = {
-        "common_agree vs GPT": evaluate(gt_agree, preds),
-        "WT vs GPT":           evaluate(gt_wt,    preds),
-        "Evelyn vs GPT":       evaluate(gt_ev,    preds),
+        f"common_agree vs {model_label}": evaluate(gt_agree, preds),
+        f"WT vs {model_label}":           evaluate(gt_wt,    preds),
+        f"Evelyn vs {model_label}":       evaluate(gt_ev,    preds),
     }
     results = {k: v for k, v in results.items() if v is not None}
     print_tables(results)
