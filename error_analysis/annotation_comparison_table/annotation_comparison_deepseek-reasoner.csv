@@ -1,0 +1,39 @@
+index,true_label,pred_label,PE_WT,PE_Evelyn,PE_deepseekreasoner,VL_WT,VL_Evelyn,VL_deepseekreasoner,FC_WT,FC_Evelyn,FC_deepseekreasoner,CE_WT,CE_Evelyn,CE_deepseekreasoner,OC_WT,OC_Evelyn,OC_deepseekreasoner,OE_WT,OE_Evelyn,OE_deepseekreasoner
+9,true,false,1,1,0,1,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+18,true,partially true,1,1,0,0,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+26,partially true,false,0,0,0,1,0,1,1,1,0,0,0,0,0,0,0,0,0,0
+27,true,false,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+29,partially true,true,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+30,true,false,1,1,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+33,true,false,1,0,0,1,1,1,1,1,1,0,0,0,0,1,0,0,0,0
+35,partially true,true,0,0,0,1,0,1,1,1,0,0,0,0,0,0,1,0,0,0
+44,partially true,false,1,1,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+50,partially true,false,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,1,0
+52,false,partially true,1,1,1,0,0,1,0,0,0,0,0,0,1,1,1,0,0,0
+53,partially true,true,1,0,0,0,0,1,1,1,1,1,1,1,0,0,0,0,0,0
+61,false,partially true,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+62,partially true,false,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0
+66,true,partially true,0,0,0,0,1,1,0,0,0,0,0,0,1,0,1,0,0,0
+68,partially true,false,1,1,0,1,1,1,1,0,1,0,0,0,1,1,0,0,0,0
+69,true,partially true,0,0,0,1,1,1,1,0,0,0,0,0,1,1,1,0,0,0
+74,partially true,false,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0
+75,true,false,0,0,1,1,1,0,1,1,0,1,1,1,0,0,0,0,0,0
+79,false,partially true,1,0,1,1,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+83,partially true,false,1,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0
+86,partially true,true,0,0,0,0,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+89,partially true,true,0,0,0,0,0,1,0,0,0,1,1,1,0,0,0,0,0,0
+95,partially true,false,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0
+98,partially true,false,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+113,partially true,false,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+116,partially true,false,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+117,true,false,0,0,0,1,1,1,1,1,1,0,0,1,0,0,0,0,0,0
+118,false,partially true,0,1,0,1,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+119,partially true,false,0,0,0,1,1,1,1,1,0,0,0,1,0,0,0,0,0,0
+120,true,false,0,0,1,1,1,1,1,1,0,0,0,1,0,0,0,0,0,0
+121,false,partially true,0,0,1,1,1,1,0,0,0,0,0,0,1,1,1,0,0,0
+123,true,partially true,0,0,0,0,0,1,1,1,1,0,0,1,0,0,0,0,0,0
+131,partially true,false,1,1,0,1,1,1,1,1,1,0,0,0,0,0,1,0,0,0
+132,true,false,0,0,0,1,1,1,1,1,0,0,0,0,0,0,1,0,0,0
+134,partially true,false,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+137,partially true,false,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
+141,true,false,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0
