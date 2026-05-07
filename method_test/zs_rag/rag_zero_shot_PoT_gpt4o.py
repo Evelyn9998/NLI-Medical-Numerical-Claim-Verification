@@ -44,13 +44,58 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import re
 import random
 import sys
 import time
 import traceback
+import types
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Safe math module — clamps inputs to avoid ValueError: math domain error
+#
+# The LLM sometimes computes a negative intermediate (e.g. from a wrong
+# formula or bad unit conversion) and passes it to math.sqrt / math.log,
+# raising "ValueError: math domain error".  We temporarily replace
+# sys.modules['math'] during exec() with a patched version that clamps
+# inputs to the valid domain, so the program keeps running and produces
+# output that the host can label as incorrect rather than crashing entirely.
+#
+# Clamping behaviour:
+#   sqrt(x)       → sqrt(max(0, x))          — returns 0 for negatives
+#   log(x)        → log(max(ε, x))           — avoids log(0) / log(neg)
+#   log10(x)      → log10(max(ε, x))
+#   log2(x)       → log2(max(ε, x))
+#   acos(x)       → acos(clamp(x, -1, 1))   — avoids out-of-range arc-cos/sin
+#   asin(x)       → asin(clamp(x, -1, 1))
+# ---------------------------------------------------------------------------
+_REAL_MATH = math  # keep a reference to the original
+
+def _make_safe_math() -> types.ModuleType:
+    """Return a math-compatible module whose domain-sensitive functions clamp inputs."""
+    _EPS = 1e-300
+
+    safe = types.ModuleType("math")
+    safe.__dict__.update(_REAL_MATH.__dict__)          # copy all constants & functions
+
+    safe.sqrt  = lambda x: _REAL_MATH.sqrt(max(0.0, float(x)))
+    safe.log   = lambda x, base=None: (
+        _REAL_MATH.log(max(_EPS, float(x))) if base is None
+        else _REAL_MATH.log(max(_EPS, float(x)), float(base))
+    )
+    safe.log10 = lambda x: _REAL_MATH.log10(max(_EPS, float(x)))
+    safe.log2  = lambda x: _REAL_MATH.log2(max(_EPS, float(x)))
+    safe.acos  = lambda x: _REAL_MATH.acos(max(-1.0, min(1.0, float(x))))
+    safe.asin  = lambda x: _REAL_MATH.asin(max(-1.0, min(1.0, float(x))))
+
+    return safe
+
+_SAFE_MATH = _make_safe_math()
+
 
 
 # ---------------------------------------------------------------------------
@@ -731,10 +776,32 @@ _ALLOWED_IMPORTS = re.compile(
     re.MULTILINE,
 )
 
-_FORBIDDEN_PATTERNS = re.compile(
-    r"\b(open|exec|eval|compile|__import__|importlib|subprocess|os\.|sys\."
-    r"|socket|urllib|requests|http|shutil|glob|pathlib|ctypes|threading"
-    r"|multiprocessing|signal|resource|pty|atexit|builtins)\b",
+
+# ---------------------------------------------------------------------------
+# Forbidden-pattern detection
+#
+# Design principle: match *calls* and *attribute access*, NOT bare words.
+# Bare words like "signal", "resource", "open" appear in legitimate medical
+# variable names and comments (e.g. neurological_signal, eye_opening,
+# verbal_response).  Requiring `(` or `.` eliminates these false positives
+# while still catching actual dangerous usage.
+#
+# Three tiers:
+#   1. Dangerous builtins that must never be called: open(), exec(), eval(),
+#      compile(), __import__()  — match as call  X(
+#   2. Dangerous module attribute access: os.*, sys.*  — match as  os.  sys.
+#   3. Dangerous modules that must never be imported (covered by import
+#      allowlist above, but belt-and-suspenders):  subprocess, socket, etc.
+#      — matched as whole-word imports only, not bare words in code.
+# ---------------------------------------------------------------------------
+_FORBIDDEN_CALLS = re.compile(
+    r"\b(open|exec|eval|compile|__import__|getattr|setattr|delattr"
+    r"|globals|locals|vars|dir)\s*\(",
+    re.IGNORECASE,
+)
+_FORBIDDEN_MODULE_ACCESS = re.compile(
+    r"\b(os|sys|subprocess|socket|urllib|requests|shutil|glob|pathlib"
+    r"|ctypes|threading|multiprocessing|importlib|pty|atexit|builtins)\s*\.",
     re.IGNORECASE,
 )
 
@@ -742,9 +809,10 @@ _FORBIDDEN_PATTERNS = re.compile(
 def _is_safe_code(code: str) -> tuple[bool, str]:
     """
     Lightweight safety check before exec():
-      - Reject any code that references dangerous builtins or I/O.
+      - Reject any code that calls dangerous builtins (open, eval, exec …).
+      - Reject any code that accesses dangerous module namespaces (os., sys. …).
       - Allow only a curated set of standard-library imports, accepting both
-        'import X' and 'from X import Y' forms.
+        'import X' and 'from X import Y' forms (validated above).
     Returns (is_safe, reason).
     """
     import_lines = re.findall(
@@ -756,8 +824,13 @@ def _is_safe_code(code: str) -> tuple[bool, str]:
         if not _ALLOWED_IMPORTS.match(line.strip()):
             return False, f"Disallowed import: {line.strip()}"
 
-    if _FORBIDDEN_PATTERNS.search(code):
-        return False, "Forbidden built-in or module reference detected."
+    m = _FORBIDDEN_CALLS.search(code)
+    if m:
+        return False, f"Forbidden call detected: {m.group(0)!r}"
+
+    m = _FORBIDDEN_MODULE_ACCESS.search(code)
+    if m:
+        return False, f"Forbidden module access detected: {m.group(0)!r}"
 
     return True, ""
 
@@ -766,6 +839,113 @@ _SCORING_BUG_RE = re.compile(
     r'^(\s*score\s*\+=\s*)(\d+)(\s+if\s+.+?\s+else\s+)(\d+)(.*?)$',
     re.MULTILINE,
 )
+
+
+def _fix_fstring_braces(code: str) -> str:
+    """
+    Escape stray '}' characters inside f-string literals.
+
+    The LLM sometimes emits f-strings where a '}' that is meant to be a
+    literal closing parenthesis or formula grouper ends up outside any
+    expression placeholder, producing a SyntaxError:
+
+        f"({x} * {y}) / ({z / 1e9} * ({w} ** 0.5}))"
+                                                  ^
+        SyntaxError: f-string: single '}' is not allowed
+
+    This function walks each line character-by-character, tracking whether
+    we are inside an f-string and whether we are inside an expression
+    placeholder (depth > 0).  A '}' encountered at depth == 0 is a stray
+    brace — it is replaced with '}}' (the escape sequence for a literal '}').
+
+    Key invariant: the '}}' escape check (for literal braces) only applies
+    OUTSIDE expression placeholders (depth == 0).  Inside an expression
+    (depth > 0), '}' always closes a nesting level and '{{' / '}}' are
+    not valid escape sequences.
+    """
+
+    def _fix_line(line: str) -> str:
+        if not re.search(r"\bf['\"]", line, re.IGNORECASE):
+            return line  # no f-string on this line — nothing to do
+
+        out: list[str] = []
+        i = 0
+        n = len(line)
+
+        while i < n:
+            c = line[i]
+
+            # Detect start of an f-string: f" or f'
+            if c in "fF" and i + 1 < n and line[i + 1] in "\"'":
+                quote = line[i + 1]
+                out.append(c)
+                out.append(quote)
+                i += 2
+                depth = 0   # 0 = in literal part of f-string; >0 = inside { }
+
+                while i < n:
+                    c2 = line[i]
+
+                    # End of f-string (only valid at depth == 0)
+                    if c2 == quote and depth == 0:
+                        out.append(c2)
+                        i += 1
+                        break
+
+                    if depth == 0:
+                        # --- Literal portion of f-string ---
+                        # Escaped brace sequences {{ and }} are only meaningful here
+                        if c2 == "{" and i + 1 < n and line[i + 1] == "{":
+                            out.append("{{")
+                            i += 2
+                            continue
+                        if c2 == "}" and i + 1 < n and line[i + 1] == "}":
+                            out.append("}}")
+                            i += 2
+                            continue
+                        if c2 == "{":
+                            # Start of an expression placeholder
+                            depth += 1
+                            out.append(c2)
+                            i += 1
+                            continue
+                        if c2 == "}":
+                            # Stray '}' with no matching '{' — escape it
+                            out.append("}}")
+                            i += 1
+                            continue
+                    else:
+                        # --- Inside an expression placeholder ---
+                        # Here {{ and }} are NOT special; only '{' and '}' matter
+                        # for tracking nesting depth.
+                        if c2 == "{":
+                            depth += 1
+                            out.append(c2)
+                            i += 1
+                            continue
+                        if c2 == "}":
+                            depth -= 1
+                            out.append(c2)
+                            i += 1
+                            continue
+
+                    out.append(c2)
+                    i += 1
+
+            else:
+                out.append(c)
+                i += 1
+
+        return "".join(out)
+
+    fixed_lines = []
+    for line in code.splitlines():
+        fixed = _fix_line(line)
+        if fixed != line:
+            print(f"  [PoT] f-string brace auto-fixed: {line.strip()!r}")
+        fixed_lines.append(fixed)
+
+    return "\n".join(fixed_lines)
 
 
 def _fix_scoring_bugs(code: str) -> str:
@@ -824,8 +1004,12 @@ def _execute_pot_code(code: str) -> tuple[dict | None, str]:
     captured = io.StringIO()
     old_stdout = sys.stdout
 
+    code = _fix_fstring_braces(code)  # escape stray } inside f-string literals
     code = _fix_scoring_bugs(code)   # auto-correct 'else N' → 'else 0' where N==N
 
+    # Swap in the safe math module so the LLM's own `import math` picks it up
+    _prev_math = sys.modules.get("math")
+    sys.modules["math"] = _SAFE_MATH
     try:
         sys.stdout = captured
         exec(compile(code, "<pot_program>", "exec"), namespace)  # noqa: S102
@@ -837,6 +1021,11 @@ def _execute_pot_code(code: str) -> tuple[dict | None, str]:
         return None, error_str
     finally:
         sys.stdout = old_stdout
+        # Always restore the real math module
+        if _prev_math is not None:
+            sys.modules["math"] = _prev_math
+        else:
+            sys.modules.pop("math", None)
 
     output = captured.getvalue().strip()
     if not output:
@@ -886,6 +1075,16 @@ def _repair_pot_code(
         f"(repair attempt {attempt}/{_MAX_REPAIR_ATTEMPTS}):\n\n"
         f"  {error}\n\n"
         "Common causes and fixes:\n"
+        "• ValueError: math domain error — math.sqrt(), math.log(), etc. received\n"
+        "  a negative or zero input.  Guard the call:\n"
+        "    correct_result_val = math.sqrt(max(0.0, evidence_value))\n"
+        "    correct_result_val = math.log(max(1e-9, evidence_value))\n"
+        "  A negative intermediate usually means you used the wrong formula or\n"
+        "  forgot to convert units (e.g. platelet count must be in 10⁹/L, not /µL).\n"
+        "• SyntaxError: f-string single '}' — a '}' appeared OUTSIDE a {expression}\n"
+        "  placeholder inside an f-string.  Either move the operation inside the\n"
+        "  braces  f'{x ** 0.5}'  or escape the literal brace  f'{x} ** 0.5}}'.\n"
+        "  Never write  f'{x} ** 0.5}'  — that trailing } is invalid.\n"
         "• NameError — a variable used in STEP 2 was never assigned in STEP 1,\n"
         "  or its name here does not exactly match the name defined above.\n"
         "  Use short, consistent names throughout:\n"
