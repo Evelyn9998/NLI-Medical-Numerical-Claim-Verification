@@ -1,0 +1,277 @@
+[
+  {
+    "Calculator ID": "2",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing Creatinine Clearance (CrCl) using the Cockcroft-Gault Equation is:\nCrCl (mL/min) = ((140 - age) x weight x gender_coefficient) / (72 x serum creatinine in mg/dL),\nwhere gender_coefficient = 1 if male, 0.85 if female, and the weight used depends on BMI as follows: if BMI < 18.5 (underweight), use actual body weight; if BMI is between 18.5 and 24.9 (normal weight), use ideal body weight (IBW); if BMI ≥ 25 (overweight/obese), use adjusted body weight (ABW).\nIdeal body weight is calculated using the Devine formula:\nIBW (kg) = 50 + 2.3 x (height in inches - 60) for males,\nIBW (kg) = 45.5 + 2.3 x (height in inches - 60) for females.\nAdjusted body weight is calculated as: ABW (kg) = IBW + 0.4 x (actual body weight - IBW)."
+  },
+  {
+    "Calculator ID": "3",
+    "Type": "Equation-Based",
+    "Formula": "Using the 2021 CKD-EPI Creatinine equation, patient's Glomerular Filtration Rate (GFR) can be computed as 142 x (Scr/A)^B x 0.9938^age x gender_coefficient, where the ^ indicates an exponent operation, Scr is the concentration of serum creatinine in mg/dL, and gender_coefficient is 1.012 if the patient is female, else the coefficient is 1. The coefficients A and B are determined based on gender and Scr: for females, A = 0.7 and B = -0.241 if Scr ≤ 0.7, A = 0.7 and B = -1.2 if Scr > 0.7; for males, A = 0.9 and B = -0.302 if Scr ≤ 0.9, A = 0.9 and B = -1.2 if Scr > 0.9."
+  },
+  {
+    "Calculator ID": "4",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the CHA2DS2-VASc score are listed below:\n\n1. Age: < 65 years = 0 points, 65-74 years = +1 point, ≥ 75 years = +2 points\n2. Sex: Female = +1 point, Male = 0 points\n3. Congestive Heart Failure (CHF) history: No = 0 points, Yes = +1 point\n4. Hypertension history: No = 0 points, Yes = +1 point\n5. Stroke, Transient Ischemic Attack (TIA), or Thromboembolism history: No = 0 points, Yes = +2 points\n6. Vascular disease history (previous myocardial infarction, peripheral artery disease, or aortic plaque): No = 0 points, Yes = +1 point\n7. Diabetes history: No = 0 points, Yes = +1 point\n\nThe CHA2DS2-VASc score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "5",
+    "Type": "Equation-Based",
+    "Formula": "The mean arterial pressure is computed by the formula 1/3 * (systolic blood pressure) + 2/3 * (diastolic blood pressure)"
+  },
+  {
+    "Calculator ID": "6",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing the patient's body mass index (BMI) is (weight)/(height * height), where weight is the patient's weight in kg and height is the patient's height in m."
+  },
+  {
+    "Calculator ID": "7",
+    "Type": "Equation-Based",
+    "Formula": "Using the Calcium Correction for Hypoalbuminemia formula to compute the patient's correct calcium level in mg/dL, the formula is  (0.8 * (Normal Albumin (in g/dL) - Patient's Albumin (in g/dL))) + Serum Calcium (in mg/dL). Normal albumin level is 4.0 g/dL."
+  },
+  {
+    "Calculator ID": "8",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Wells' Criteria for Pulmonary Embolism score are listed below:\n\n1. Clinical signs and symptoms of DVT: No = 0 points, Yes = +3 points\n2. PE is #1 diagnosis OR equally likely: No = 0 points, Yes = +3 points\n3. Heart rate > 100: No = 0 points, Yes = +1.5 points\n4. Immobilization at least 3 days OR surgery in the previous 4 weeks: No = 0 points, Yes = +1.5 points\n5. Previous, objectively diagnosed PE or DVT: No = 0 points, Yes = +1.5 points\n6. Hemoptysis: No = 0 points, Yes = +1 point\n7. Malignancy with treatment within 6 months or palliative: No = 0 points, Yes = +1 point\n\nThe total score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "9",
+    "Type": "Equation-Based",
+    "Formula": "The patient's estimated GFR is calculated using the MDRD equation as:\nGFR = 175 * creatinine^(-1.154) * age^(-0.203) * race_coefficient(=1.0 if race is non-Black or unspecified; =1.212 if African American; ) * gender_coefficient(0.742 if female, 1 if male). The creatinine concentration is mg/dL. Note: If race is NOT mentioned, use 1.0 as the race coefficient."
+  },
+  {
+    "Calculator ID": "10",
+    "Type": "Equation-Based",
+    "Formula": "Using the Ideal Body Weight Formula to calculate IBW: For males, the patient's ideal body weight (IBW) is calculated as follows:\nIBW = 50 kg + 2.3 kg * (height (in inches) - 60). \n For females, the ideal body weight (IBW) is calculated as follows:\nIBW = 45.5 kg + 2.3 kg * (height (in inches) - 60)."
+  },
+  {
+    "Calculator ID": "11",
+    "Type": "Equation-Based",
+    "Formula": "The corrected QT interval using the Bazett formula is computed as QTc = QT interval (msec) / √(RR interval (sec)), where the QT interval is measured in milliseconds (msec), and the RR interval is given as 60 ÷ heart rate (beats/min), resulting in RR interval in seconds (sec)."
+  },
+  {
+    "Calculator ID": "15",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Child-Pugh Score are listed below:\n\n1. Bilirubin (Total): <2 mg/dL (<34.2 μmol/L) = +1 point, 2-3 mg/dL (34.2-51.3 μmol/L) = +2 points, >3 mg/dL (>51.3 μmol/L) = +3 points\n2. Albumin: >3.5 g/dL (>35 g/L) = +1 point, 2.8-3.5 g/dL (28-35 g/L) = +2 points, <2.8 g/dL (<28 g/L) = +3 points\n3. INR: <1.7 = +1 point, 1.7-2.3 = +2 points, >2.3 = +3 points\n4. Ascites: Absent = +1 point, Slight = +2 points, Moderate = +3 points\n5. Encephalopathy: No Encephalopathy = +1 point, Grade 1-2 = +2 points, Grade 3-4 = +3 points \n(Grade 0: normal consciousness, personality, neurological examination, electroencephalogram\nGrade 1: restless, sleep disturbed, irritable/agitated, tremor, impaired handwriting, 5 cps waves\nGrade 2: lethargic, time-disoriented, inappropriate, asterixis, ataxia, slow triphasic waves\nGrade 3: somnolent, stuporous, place-disoriented, hyperactive reflexes, rigidity, slower waves\nGrade 4: unrousable coma, no personality/behavior, decerebrate, slow 2-3 cps delta activity)\n\nThe Child-Pugh Score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "16",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Wells' Criteria for Deep Vein Thrombosis (DVT) score are listed below:\n\n1. Active cancer (treatment or palliation within 6 months): No = 0 points, Yes = +1 point\n2. Bedridden recently >3 days or major surgery within 12 weeks: No = 0 points, Yes = +1 point\n3. Calf swelling >3 cm compared to the other leg (measured 10 cm below tibial tuberosity): No = 0 points, Yes = +1 point\n4. Collateral (nonvaricose) superficial veins present: No = 0 points, Yes = +1 point\n5. Entire leg swollen: No = 0 points, Yes = +1 point\n6. Localized tenderness along the deep venous system: No = 0 points, Yes = +1 point\n7. Pitting edema, confined to symptomatic leg: No = 0 points, Yes = +1 point\n8. Paralysis, paresis, or recent plaster immobilization of the lower extremity: No = 0 points, Yes = +1 point\n9. Previously documented DVT: No = 0 points, Yes = +1 point\n10. Alternative diagnosis to DVT as likely or more likely: No = 0 points, Yes = -2 points\n\nThe total score is calculated by summing the points for each criterion"
+  },
+  {
+    "Calculator ID": "17",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Revised Cardiac Risk Index (RCRI) are listed below:\n\n1. Elevated-risk surgery (intraperitoneal, intrathoracic, or suprainguinal vascular): No = 0 points, Yes = +1 point\n2. History of ischemic heart disease (history of myocardial infarction, positive exercise test, current chest pain due to myocardial ischemia, use of nitrate therapy, or ECG with pathological Q waves): No = 0 points, Yes = +1 point\n3. History of congestive heart failure (pulmonary edema, bilateral rales or S3 gallop, paroxysmal nocturnal dyspnea, or chest x-ray showing pulmonary vascular redistribution): No = 0 points, Yes = +1 point\n4. History of cerebrovascular disease (prior transient ischemic attack or stroke): No = 0 points, Yes = +1 point\n5. Pre-operative treatment with insulin: No = 0 points, Yes = +1 point\n6. Pre-operative creatinine >2 mg/dL (176.8 μmol/L): No = 0 points, Yes = +1 point\n\nThe total score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "18",
+    "Type": "Rule-Based",
+    "Formula": "The HEART Score for risk stratification in patients with chest pain is shown below:\n\n1. History: Slightly suspicious = 0 points, Moderately suspicious = +1 point, Highly suspicious = +2 points\n2. EKG: Normal = 0 points, Non-specific repolarization disturbance = +1 point, Significant ST deviation = +2 points\n3. Age: <45 years = 0 points, 45-64 years = +1 point, ≥65 years = +2 points\n4. Risk factors (HTN, hypercholesterolemia, DM, obesity (BMI >30 kg/m²), smoking (current or cessation within 3 months), positive family history of cardiovascular disease before age 65, atherosclerotic disease such as prior MI, PCI/CABG, CVA/TIA, or peripheral arterial disease): No known risk factors = 0 points, 1-2 risk factors = +1 point, ≥3 risk factors or history of atherosclerotic disease = +2 points\n5. Initial troponin level: ≤normal limit = 0 points, 1-3x normal limit = +1 point, >3x normal limit = +2 points\n\nThe total score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "19",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing Fibrosis-4 index is Fib-4 = (Age * AST) / (Platelet count (in billions) * √ALT), where platelet count is the number of billions per L, and the units for AST and ALT are both U/L. Unit Convertion:  1 K/μL = 1 billion/L"
+  },
+  {
+    "Calculator ID": "20",
+    "Type": "Rule-Based",
+    "Formula": "The criteria listed in the Centor Score formula are listed below:\n\n1. Age: 3-14 years = +1 point, 15-44 years = 0 points, ≥45 years = -1 point\n2. Exudate or swelling on tonsils: No = 0 points, Yes = +1 point\n3. Tender/swollen anterior cervical lymph nodes: No = 0 points, Yes = +1 point\n4. Temperature >38°C (100.4°F): No = 0 points, Yes = +1 point\n5. Cough: Cough present = 0 points, Cough absent = +1 point\n\nThe Centor score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "22",
+    "Type": "Equation-Based",
+    "Formula": "For patients whose weight is **10 kg or less**, the formula for computing the maintenance fluid is:   4 mL/kg/hr * weight (in kilograms).\n For patients whose weight is between 11 kg and 20 kg, the formula for computing the maintenance fluid is: 40 mL/hr + 2 mL/kg/hr * (weight (in kilograms) - 10 kilograms)\n For patients whose weight is greater than 20 kg, the formula for computing the maintenance fluid is:  60 mL/hr + 1 mL/kg/hr * (weight (in kilograms) - 20 kilograms)"
+  },
+  {
+    "Calculator ID": "23",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing the MELD Na is to first apply the following equation: MELD(i) = 0.957 x ln(Cr) + 0.378 x ln(bilirubin) + 1.120 x ln(INR) + 0.643.\nIf the MELD(i) is greater than 11 after rounding to the nearest tenth and multiplying the MELD(i) by 10, we apply the following equation: MELD = MELD(i) + 1.32 x (137 - Na) -  [ 0.033 x MELD(i) x (137 - Na)]. The MELD Na score is capped at 40. The concentration of Na is mEq/L, the concentration of bilirubin is mg/dL, and the concentration of creatinine is mg/dL. If the patient's Na concentration is less than 125 mEq/L, we set it to 125 mEq/L and if the patient's the Na concentration is greater 137 mEq/L, we round it to 137 mEq/L."
+  },
+  {
+    "Calculator ID": "25",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the HAS-BLED score are listed below below:\n\n1. Hypertension (Uncontrolled, >160 mmHg systolic): No = 0 points, Yes = +1 point\n2. Renal disease (Dialysis, transplant, Cr >2.26 mg/dL or >200 µmol/L): No = 0 points, Yes = +1 point\n3. Liver disease (Cirrhosis or bilirubin >2x normal with AST/ALT/AP >3x normal): No = 0 points, Yes = +1 point\n4. Stroke history: No = 0 points, Yes = +1 point\n5. Prior major bleeding or predisposition to bleeding: No = 0 points, Yes = +1 point\n6. Labile INR (Unstable/high INRs, time in therapeutic range <60%): No = 0 points, Yes = +1 point\n7. Age >65: No = 0 points, Yes = +1 point\n8. Medication usage predisposing to bleeding (Aspirin, clopidogrel, NSAIDs): No = 0 points, Yes = +1 point\n9. Alcohol use (≥8 drinks/week): No = 0 points, Yes = +1 point\n\nThe total HAS-BLED score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "26",
+    "Type": "Equation-Based",
+    "Formula": "The formula for Sodium Correction for Hyperglycemia based on Hiller, 1999 is Measured sodium + 0.024 * (Serum glucose - 100), where Measured Sodium is the sodium concentration in mEq/L and the Serum glucose is the concentration of glucose in mg/dL."
+  },
+  {
+    "Calculator ID": "27",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Glasgow-Blatchford Bleeding Score are listed below:\n\n1. BUN (mg/dL): <18.2 = 0 points, 18.2-22.3 = +2 points, 22.4-28 = +3 points, 28-70 = +4 points, >70 = +6 points\n2. Hemoglobin (g/dL) for men: >=13 = 0 points, <=12-13 = +1 point, <=10-12 = +3 points, <10 = +6 points\n3. Hemoglobin (g/dL) for women: >=12 = 0 points, <=10-12 = +1 point, <10 = +6 points\n4. Systolic blood pressure (mm Hg): ≥110 = 0 points, 100-109 = +1 point, 90-99 = +2 points, <90 = +3 points\n5. Pulse ≥100 (per minute): No = 0 points, Yes = +1 point\n6. Melena present: No = 0 points, Yes = +1 point\n7. Presentation with syncope: No = 0 points, Yes = +1 point\n8. Liver disease history: No = 0 points, Yes = +1 point\n9. Cardiac failure present: No = 0 points, Yes = +1 point\n\nThe total Glasgow-Blatchford Score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "30",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing serum osmolality is 2 * Na + (BUN / 2.8) + (glucose / 18), where Na is the concentration of sodium in mmol/L, the concentration of BUN is in mg/dL, and the concentration of glucose is in mg/dL."
+  },
+  {
+    "Calculator ID": "31",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing HOMA-IR score is (insulin (µIU/mL) * glucose mg/dL)/405."
+  },
+  {
+    "Calculator ID": "32",
+    "Type": "Rule-Based",
+    "Formula": "The Charlson Comorbidity Index (CCI) are listed below:\n\n1. Age: <50 years = 0 points, 50-59 years = +1 point, 60-69 years = +2 points, 70-79 years = +3 points, ≥80 years = +4 points\n2. Myocardial infarction (history of definite or probable MI with EKG changes and/or enzyme changes): No = 0 points, Yes = +1 point\n3. Congestive heart failure (CHF) (exertional or paroxysmal nocturnal dyspnea, responsive to digitalis, diuretics, or afterload reducing agents): No = 0 points, Yes = +1 point\n4. Peripheral vascular disease (intermittent claudication, past bypass for chronic arterial insufficiency, history of gangrene or acute arterial insufficiency, untreated thoracic or abdominal aneurysm ≥6 cm): No = 0 points, Yes = +1 point\n5. Cerebrovascular accident (CVA) or transient ischemic attack (TIA) (history with minor or no residuals): No = 0 points, Yes = +1 point\n6. Dementia (chronic cognitive deficit): No = 0 points, Yes = +1 point\n7. Chronic pulmonary disease (CPD): No = 0 points, Yes = +1 point\n8. Connective tissue disease: No = 0 points, Yes = +1 point\n9. Peptic ulcer disease (any history of treatment for ulcer disease or ulcer bleeding): No = 0 points, Yes = +1 point\n10. Liver disease: None = 0 points, Mild = +1 point, Moderate to severe = +3 points\n11. Diabetes mellitus: None or diet-controlled = 0 points, Uncomplicated = +1 point, End-organ damage = +2 points\n12. Hemiplegia: No = 0 points, Yes = +2 points\n13. Moderate to severe chronic kidney disease (CKD): No = 0 points, Yes = +2 points\n14. Solid tumor: None = 0 points, Localized = +2 points, Metastatic = +6 points\n15. Leukemia: No = 0 points, Yes = +2 points\n16. Lymphoma: No = 0 points, Yes = +2 points\n17. AIDS: No = 0 points, Yes = +6 points\n\nThe total score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "33",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the FeverPAIN score are listed below:\n    \n1. Fever in past 24 hours: No = 0 points, Yes = +1 point\n2. Absence of cough or coryza: No = 0 points, Yes = +1 point\n3. Symptom onset ≤3 days: No = 0 points, Yes = +1 point\n4. Purulent tonsils: No = 0 points, Yes = +1 point\n5. Severe tonsil inflammation: No = 0 points, Yes = +1 point\n\nThe FeverPAIN score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "38",
+    "Type": "Equation-Based",
+    "Formula": "Free water deficit (L) = (total body water fraction) * (body weight in kg) * (measured sodium concentration ÷ 140 - 1).\n The patient's total body weight fraction is based on the patient's age and gender, typically:Adult males: 0.6; Adult females: 0.5; Male over 65 years: 0.5; Females over 65 years: 0.45.\n Measured sodium concentration is measured in mmol/L."
+  },
+  {
+    "Calculator ID": "39",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "45",
+    "Type": "Rule-Based",
+    "Formula": "The CURB-65 Score criteria are listed below:\n\n1. Confusion: No = 0 points, Yes = +1 point\n2. BUN >19 mg/dL (>7 mmol/L urea): No = 0 points, Yes = +1 point\n3. Respiratory Rate ≥30: No = 0 points, Yes = +1 point\n4. Systolic BP <90 mmHg or Diastolic BP ≤60 mmHg: No = 0 points, Yes = +1 point\n5. Age ≥65: No = 0 points, Yes = +1 point\n\nThe total CURB-65 score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "40",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing the Fractional Excretion of Sodium (FEna) percentage is (creatinine * urine_sodium)/(sodium * urine_creatinine) * 100, where creatinine is the concentration in mg/dL, urine sodium is the concentration in mEq/L, sodium is the concentration mEq/L, and urine creatinine is the concentration in mg/dL."
+  },
+  {
+    "Calculator ID": "44",
+    "Type": "Equation-Based",
+    "Formula": "To compute the patient's LDL cholestrol, apply the following formula: LDL cholesterol = total cholesterol - HDL - (triglycerides / 5), where the units for total cholestrol, HDL cholesterol, and triglycerides are all mg/dL."
+  },
+  {
+    "Calculator ID": "46",
+    "Type": "Equation-Based",
+    "Formula": "For males, the formula for computing the Framingham Risk Score for Hard Coronary Heart Disease is:\n52.00961 * ln(age) + 20.014077 * ln(total_cholesterol) + -0.905964 * ln(hdl_cholesterol) + 1.305784 * ln(sys_bp) + 0.241549 * bp_medicine + 12.096316 * smoker + -4.605038 * ln(age) * ln(total_cholesterol) + -2.84367 * ln(age_smoke) * smoker + -2.93323 * ln(age) * ln(age) - 172.300168.\nThe patient's age is capped at 70 for the ln(age_smoke) * smoker term if greater than 70. The 10-year risk percentage is calculated as: [1 - 0.9402^exp(risk_score)] * 100.\nFor females, the formula for computing the Framingham Risk Score is:\n31.764001 * ln(age) + 22.465206 * ln(total_cholesterol) + -1.187731 * ln(hdl_cholesterol) + 2.552905 * ln(sys_bp) + 0.420251 * bp_medicine + 13.07543 * smoker + -5.060998 * ln(age) * ln(total_cholesterol) + -2.996945 * ln(age_smoke) * smoker - 146.5933061.\nThe patient's age is capped at 78 for the ln(age_smoke) * smoker term if greater than 78. The 10-year risk percentage is calculated as: [1 - 0.98767^exp(risk_score)] * 100."
+  },
+  {
+    "Calculator ID": "48",
+    "Type": "Rule-Based",
+    "Formula": "The PERC Rule critiera are listed below:\n\n1. Age ≥50: No = 0 points, Yes = +1 point\n2. Heart Rate (HR) ≥100: No = 0 points, Yes = +1 point\n3. O₂ saturation on room air <95%: No = 0 points, Yes = +1 point\n4. Unilateral leg swelling: No = 0 points, Yes = +1 point\n5. Hemoptysis: No = 0 points, Yes = +1 point\n6. Recent surgery or trauma (within 4 weeks, requiring treatment with general anesthesia): No = 0 points, Yes = +1 point\n7. Prior pulmonary embolism (PE) or deep vein thrombosis (DVT): No = 0 points, Yes = +1 point\n8. Hormone use (oral contraceptives, hormone replacement, or estrogenic hormone use in males or females): No = 0 points, Yes = +1 point\n\nThe total number of criteria met is taken by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "51",
+    "Type": "Rule-Based",
+    "Formula": "The rules for SIRS Criteria are listed below:\n    \n1. Temperature >38°C (100.4°F) or <36°C (96.8°F): No = 0 points, Yes = +1 point\n2. Heart rate >90: No = 0 points, Yes = +1 point\n3. Respiratory rate >20 or PaCO₂ <32 mm Hg: No = 0 points, Yes = +1 point\n4. White blood cell count (WBC) >12,000/mm³, <4,000/mm³, or >10% bands: No = 0 points, Yes = +1 point\n\nThe total number of criteria met is taken by summing the score for each criteria."
+  },
+  {
+    "Calculator ID": "56",
+    "Type": "Equation-Based",
+    "Formula": "The corrected QT interval using the Fredericia formula is computed as QTc = QT interval (ms) / (RR interval (s))^(1/3), where ^ denotes an exponent. The QT interval is measured in milliseconds (ms), and the RR interval is calculated as 60 ÷ heart rate (beats/min), resulting in RR interval in seconds (s)."
+  },
+  {
+    "Calculator ID": "57",
+    "Type": "Equation-Based",
+    "Formula": "The corrected QT interval using the Framingham formula is computed as QTc = QT interval (ms) + 154 (ms) × (1 − RR interval (s)), where the QT interval is measured in milliseconds (ms), and the RR interval is calculated as 60 ÷ heart rate (beats/min), resulting in RR interval in seconds (s)."
+  },
+  {
+    "Calculator ID": "58",
+    "Type": "Equation-Based",
+    "Formula": "The corrected QT interval using the Hodges formula is computed as QTc = QT interval (ms) + 1.75 × (heart rate (beats/min) − 60), where the QT interval is measured in milliseconds (ms), and the heart rate is in beats per minute (beats/min)."
+  },
+  {
+    "Calculator ID": "59",
+    "Type": "Equation-Based",
+    "Formula": "The corrected QT interval using the Rautaharju formula is computed as QTc = QT interval x (120 + HR) / 180, where QT interval is in msec, and HR is the heart rate in beats per minute."
+  },
+  {
+    "Calculator ID": "60",
+    "Type": "Equation-Based",
+    "Formula": "For the body surface area computation, the formula is sqrt((weight (in kgs) * height (in cm))/3600, where the units of weight is in kg and the units of height is in cm."
+  },
+  {
+    "Calculator ID": "62",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing the patient's adjusted body weight (ABW) is ABW = IBW + 0.4 * (actual weight (kg) - IBW),  where IBW (ideal body weight) is calculated as 50 kg + 2.3 kg * (height (inches) - 60) for males and as 45.5 kg + 2.3 kg * (height (inches) - 60) for females."
+  },
+  {
+    "Calculator ID": "63",
+    "Type": "Equation-Based",
+    "Formula": "To compute the delta gap, the formula is anion gap (in mEq/L) - 12.\n The formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "64",
+    "Type": "Equation-Based",
+    "Formula": "To compute the delta ratio, the formula is delta gap (mEq/L)/(24 - bicarbonate mEq/L).\nTo compute the delta gap, the formula is anion gap (in mEq/L) - 12. The formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "65",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing a patient's albumin corrected anion gap is: anion_gap (in mEq/L) + 2.5 * (4 - albumin (in g/dL)).\nThe formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "66",
+    "Type": "Equation-Based",
+    "Formula": "To compute the formula of albumin corrected delta gap, the formula is albumin corrected anion gap (in mEq/L) - 12.\nThe formula for computing a patient's albumin corrected anion gap is: anion_gap (in mEq/L) + 2.5 * (4 - albumin (in g/dL)).\nThe formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "67",
+    "Type": "Equation-Based",
+    "Formula": "The formula for computing the albumin corrected delta ratio is albumin corrected delta gap (mEq/L)/(24 - bicarbonate mEq/L).\nTo compute the formula of albumin corrected delta gap, the formula is albumin corrected anion gap (in mEq/L) - 12.\nThe formula for computing a patient's albumin corrected anion gap is: anion_gap (in mEq/L) + 2.5 * (4 - albumin (in g/dL)).\nThe formula for computing a patient's anion gap is: sodium (mEq/L) - (chloride (mEq/L)+ bicarbonate (mEq/L))."
+  },
+  {
+    "Calculator ID": "29",
+    "Type": "Rule-Based",
+    "Formula": "The rules for computing the Pneumonia Severity Index (PSI) are shown below:\n\n1. Age: Enter age in years (age score will be equal to age in years)\n2. Sex: Female = -10 points, Male = 0 points\n3. Nursing home resident: No = 0 points, Yes = +10 points\n4. Neoplastic disease: No = 0 points, Yes = +30 points\n5. Liver disease history: No = 0 points, Yes = +20 points\n6. Congestive heart failure (CHF) history: No = 0 points, Yes = +10 points\n7. Cerebrovascular disease history: No = 0 points, Yes = +10 points\n8. Renal disease history: No = 0 points, Yes = +10 points\n9. Altered mental status: No = 0 points, Yes = +20 points\n10. Respiratory rate ≥30 breaths/min: No = 0 points, Yes = +20 points\n11. Systolic blood pressure <90 mmHg: No = 0 points, Yes = +20 points\n12. Temperature <35°C (95°F) or >39.9°C (103.8°F): No = 0 points, Yes = +15 points\n13. Pulse ≥125 beats/min: No = 0 points, Yes = +10 points\n14. pH <7.35: No = 0 points, Yes = +30 points\n15. BUN ≥30 mg/dL or ≥11 mmol/L: No = 0 points, Yes = +20 points\n16. Sodium <130 mmol/L: No = 0 points, Yes = +20 points\n17. Glucose ≥250 mg/dL or ≥14 mmol/L: No = 0 points, Yes = +10 points\n18. Hematocrit <30%: No = 0 points, Yes = +10 points\n19. Partial pressure of oxygen <60 mmHg or <8 kPa: No = 0 points, Yes = +10 points\n20. Pleural effusion on x-ray: No = 0 points, Yes = +10 points\n\nThe total score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "21",
+    "Type": "Rule-Based",
+    "Formula": "The Glasgow Coma Scale (GCS) for assessing a patient's level of consciousness is shown below:\n    \n1. Best Eye Response: Spontaneously = +4 points, To verbal command = +3 points, To pain = +2 points, No eye opening = +1 point\n2. Best Verbal Response: Oriented = +5 points, Confused = +4 points, Inappropriate words = +3 points, Incomprehensible sounds = +2 points, No verbal response = +1 point\n3. Best Motor Response: Obeys commands = +6 points, Localizes pain = +5 points, Withdrawal from pain = +4 points, Flexion to pain = +3 points, Extension to pain = +2 points, No motor response = +1 point\n\nFor each criteria, if a patient's value is not mentioned/not testable in the note, we assume that it gets the full score for that attribute.  The total GCS score is calculated by summing the points for each of the three components."
+  },
+  {
+    "Calculator ID": "28",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the APACHE II Score are listed below:\n\n1. Age, years: ≤44 = 0 points, 45-54 = +2 points, 55-64 = +3 points, 65-74 = +5 points, ≥75 = +6 points\n2. History of severe organ insufficiency or immunocompromised: Yes, nonoperative or emergency postoperative patient = +5 points, Yes, elective postoperative patient = +2 points, No = 0 points\n3. Rectal temperature, °C: ≥41 = +4 points, 39 to <41 = +3 points, 38.5 to <39 = +1 point, 36 to <38.5 = 0 points, 34 to <36 = +1 point, 32 to <34 = +2 points, 30 to <32 = +3 points, <30 = +4 points\n4. Mean arterial pressure, mmHg: ≥160 = +4 points, 130-159 = +3 points, 110-129 = +2 points, 70-109 = 0 points, 50-69 = +2 points, 40-49 = +3 points, <40 = +4 points\n5. Heart rate, beats per minute: ≥180 = +4 points, 140 to <180 = +3 points, 110 to <140 = +2 points, 70 to <110 = 0 points, 55 to <70 = +2 points, 40 to <55 = +3 points, <40 = +4 points\n6. Respiratory rate, breaths per minute: ≥50 = +4 points, 35 to <50 = +3 points, 25 to <35 = +1 point, 12 to <25 = 0 points, 10 to <12 = +1 point, 6 to <10 = +2 points, <6 = +4 points\n7. Oxygenation (use PaO2 if FiO2 <50%, otherwise use Aa gradient): Aa gradient >349 = +4 points, Aa gradient 350-349 = +3 points, Aa gradient 200-349 = +2 points, Aa gradient <200 (if FiO2 over 45%) or PaO2 <70 (if FiO2 less than 50%) = +1 point, PaO2 61-70 = +1 point, PaO2 55-60 = +3 points, PaO2 <55 = +4 points\n8. Arterial pH: ≥7.7 = +4 points, 7.60 to <7.70 = +3 points, 7.50 to <7.60 = +1 point, 7.33 to <7.50 = 0 points, 7.25 to <7.33 = +2 points, 7.15 to <7.25 = +3 points, <7.15 = +4 points\n9. Serum sodium, mmol/L: ≥180 = +4 points, 160 to <180 = +3 points, 155 to <160 = +2 points, 150 to <155 = +1 point, 130 to <150 = 0 points, 120 to <130 = +2 points, 111 to <120 = +3 points, <111 = +4 points\n10. Serum potassium, mmol/L: ≥7.0 = +4 points, 6.0 to <7.0 = +3 points, 5.5 to <6.0 = +1 point, 3.5 to <5.5 = 0 points, 3.0 to <3.5 = +1 point, 2.5 to <3.0 = +2 points, <2.5 = +4 points\n11. Serum creatinine, mg/100 mL: ≥3.5 and ACUTE renal failure = +8 points, 2.0 to <3.5 and ACUTE renal failure = +6 points, ≥3.5 and CHRONIC renal failure = +4 points, 1.5 to <2.0 and ACUTE renal failure = +4 points, 2.0 to <3.5 and CHRONIC renal failure = +3 points, 1.5 to <2.0 and CHRONIC renal failure = +2 points, 0.6 to <1.5 = 0 points, <0.6 = +2 points\n12. Hematocrit, %: ≥60 = +4 points, 50 to <60 = +2 points, 46 to <50 = +1 point, 30 to <46 = 0 points, 20 to <30 = +2 points, <20 = +4 points\n13. White blood count, total/cubic mm in 10^3: ≥40 = +4 points, 20 to <40 = +2 points, 15 to <20 = +1 point, 3 to <15 = 0 points, 1 to <3 = +2 points, <1 = +4 points\n14. Glasgow Coma Scale (GCS): 1-15 points (use 15 - [GCS Score])\n\nThe total APACHE II score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "43",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Sequential Organ Failure Assessment (SOFA) Score are shown below:\n    \n1. PaO₂/FiO₂ ratio (mm Hg): ≥400 = 0 points, 300-399 = +1 point, 200-299 = +2 points, 100-199 (with respiratory support) = +3 points, <100 (with respiratory support) = +4 points\n2. Platelets (x10³/µL): ≥150 = 0 points, 100-149 = +1 point, 50-99 = +2 points, 20-49 = +3 points, <20 = +4 points\n3. Glasgow Coma Scale (GCS): 15 = 0 points, 13-14 = +1 point, 10-12 = +2 points, 6-9 = +3 points, <6 = +4 points\n4. Bilirubin (mg/dL): <1.2 = 0 points, 1.2-1.9 = +1 point, 2.0-5.9 = +2 points, 6.0-11.9 = +3 points, ≥12.0 = +4 points\n5. Mean arterial pressure (MAP) or administration of vasopressors (in mcg): No hypotension = 0 points, MAP <70 mmHg = +1 point, Dopamine ≤5 or Dobutamine (any dose) = +2 points, Dopamine >5 or Epinephrine ≤0.1 or norepinephrine ≤0.1 = +3 points, Dopamine >15 or Epinephrine >0.1 or norepinephrine >0.1 = +4 points\n6. Creatinine (mg/dL) or urine output: <1.2 = 0 points, 1.2-1.9 = +1 point, 2.0-3.4 = +2 points, 3.5-4.9 or urine output <500 mL/day = +3 points, ≥5.0 or urine output <200 mL/day = +4 points\n\nThe total SOFA Score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "36",
+    "Type": "Rule-Based",
+    "Formula": "The criteria for the Caprini Score for Venous Thromboembolism are listed below:\n\n1. Age, years: ≤40 = 0 points, 41-60 = +1 point, 61-74 = +2 points, ≥75 = +3 points\n2. Sex: Male = 0 points, Female = +1 point\n3. Type of surgery: None = 0 points, Minor = +1 point, Major >45 min (laparoscopic or arthroscopic) = +2 points, Elective major lower extremity arthroplasty = +5 points\n4. Recent (≤1 month) event: Major surgery = +1 point, Congestive heart failure (CHF) = +1 point, Sepsis = +1 point, Pneumonia = +1 point, Immobilizing plaster cast = +1 point, Hip, pelvis, or leg fracture = +5 points, Stroke = +5 points, Multiple trauma = +5 points, Acute spinal cord injury causing paralysis = +5 points\n5. Venous disease or clotting disorder: Varicose veins = +1 point, Current swollen legs = +1 point, Current central venous access = +2 points, History of deep vein thrombosis (DVT) or pulmonary embolism (PE) = +3 points, Family history of thrombosis = +3 points, Positive Factor V Leiden = +3 points, Positive prothrombin 20210A = +3 points, Elevated serum homocysteine = +3 points\n6. Other congenital or acquired thrombophilia: Positive lupus anticoagulant = +3 points, Elevated anticardiolipin antibody = +3 points, Heparin-induced thrombocytopenia = +3 points\n7. Mobility: Normal, out of bed = 0 points, Medical patient currently on bed rest = +1 point, Patient confined to bed >72 hours = +2 points\n8. Other present and past history: History of inflammatory bowel disease = +1 point, BMI ≥25 = +1 point, Acute myocardial infarction = +1 point, Chronic obstructive pulmonary disease (COPD) = +1 point, Present or previous malignancy = +2 points\n\nThe total Caprini Score is calculated by summing the points for each criterion."
+  },
+  {
+    "Calculator ID": "13",
+    "Type": "Equation-Based",
+    "Formula": "The patient's estimated due date based on their last menstrual period and cycle length is computed by using Naegele's Rule. Estimated Due Date (EDD) = Last Menstrual Period (LMP) date + 280 days + abs(28 - cycle length) days"
+  },
+  {
+    "Calculator ID": "24",
+    "Type": "Equation-Based",
+    "Formula": "The Steroid Conversions providing equivalent doses for various corticosteroids are listed below:\n1. Betamethasone: Route = IV, Equivalent Dose = 0.75 mg\n2. Cortisone: Route = PO, Equivalent Dose = 25 mg\n3. Dexamethasone (Decadron): Route = IV or PO, Equivalent Dose = 0.75 mg\n4. Hydrocortisone: Route = IV or PO, Equivalent Dose = 20 mg\n5. MethylPrednisoLONE: Route = IV or PO, Equivalent Dose = 4 mg\n6. PrednisoLONE: Route = PO, Equivalent Dose = 5 mg\n7. PredniSONE: Route = PO, Equivalent Dose = 5 mg\n8. Triamcinolone: Route = IV, Equivalent Dose = 4 mg"
+  },
+  {
+    "Calculator ID": "61",
+    "Type": "Equation-Based",
+    "Formula": "Based on the patient's height and target BMI, the Target Weight (kg) = Target BMI * (Height in meters)**2"
+  },
+  {
+    "Calculator ID": "49",
+    "Type": "Equation-Based",
+    "Formula": "The Opioid Conversion Table with MME (Morphine Milligram Equivalent) conversion factors are listed below:\n1. Codeine: MME conversion factor = 0.15\n2. FentaNYL buccal: MME conversion factor = 0.13\n3. HYDROcodone: MME conversion factor = 1\n4. HYDROmorphone: MME conversion factor = 5\n5. Methadone: MME conversion factor = 4.7\n6. Morphine: MME conversion factor = 1\n7. OxyCODONE: MME conversion factor = 1.5\n8. OxyMORphone: MME conversion factor = 3\n9. Tapentadol: MME conversion factor = 0.4\n10. TraMADol: MME conversion factor = 0.2\n11. Buprenorphine: MME conversion factor = 10"
+  },
+  {
+    "Calculator ID": "68",
+    "Type": "Equation-Based",
+    "Formula": "The patient's estimated date of conception based on their last period is computed by adding to 2 weeks to the patient's last menstrual period date. All dates are expressed in U.S. format (MM/DD/YYYY)."
+  },
+  {
+    "Calculator ID": "69",
+    "Type": "Equation-Based",
+    "Formula": "To compute the estimated gestational age based on the patient's last menstrual period, we compute the number of weeks and days apart today's date is from the patient's last menstrual period date. All dates are expressed in U.S. format (MM/DD/YYYY)."
+  }
+]
