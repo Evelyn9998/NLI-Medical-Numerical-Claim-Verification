@@ -1,228 +1,344 @@
 """
-Evaluation script for NLI Medical Numerical Verification results.
+evaluate.py – Preprocess (if needed) + Evaluate in one step.
 
-Indicators
-──────────
-  TF  – Task Fulfillment        : % of rows with a valid (non-unknown) predicted label
-  CS  – Calculator Selection    : % of rows where the correct calculator was identified
-  PE  – Parameter Extraction    : % of rows where all required parameters were correctly extracted
-  QP  – Quantitative Precision  : % of rows where the computed value falls within [Lower, Upper]
+Usage
+-----
+  python evaluate.py <result_csv> [--gt mrt_claim_cleaned.csv] [--name display_name] [--save output.csv]
 
-Classification Metrics (label-level)
-─────────────────────────────────────
-  Per-class    Precision, Recall, F1, Support
-  Macro avg    unweighted mean over classes
-  Weighted avg weighted by per-class support
-  Accuracy     overall exact-match rate; unknown predictions counted as wrong
-
-Inputs
-──────
-  mrt_claim_cleaned.csv                  (ground truth)
-  01_zs_cot_llama_processed_filled.csv   (model output)
-
-Both files are row-aligned (same order, 2814 rows each).
+What it does
+------------
+  1. Loads the result CSV.
+  2. Detects which of the three columns are missing:
+       • calculator_selected
+       • step1_extracted_params
+       • step2_computed_value
+     Fills any missing ones from model_reasoning; skips if all present.
+  3. Runs full evaluation (TF / CS / PE / QP + classification report).
 """
 
 import argparse
 import ast
 import json
 import re
-from dateutil import parser as dateparser
 import warnings
-import pandas as pd
+from datetime import datetime
+from dateutil import parser as dateparser
+
 import numpy as np
+import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# ── 0. Load data ──────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser()
-parser.add_argument("result_file", nargs="?", default="results/2_zs_cot/processed/zs_cot_gpt_processed.csv",
-                    help="Path to model result CSV (default: zs_cot_gpt_processed.csv)")
-parser.add_argument("--all", action="store_true",
-                    help="Run evaluation on every CSV file found under results/")
-args = parser.parse_args()
 
-mrt = pd.read_csv("mrt_claim_cleaned.csv")
+# ── PART 1  Preprocessing  (3columns logic inlined) ──────────────────────────
+
+def extract_calculator_selected(formula: str) -> str:
+    if not formula or formula.strip().lower() in ("not applicable", "not found", "", "none"):
+        return "not applicable"
+    formula = formula.strip()
+    formula = re.sub(
+        r"\s*(calculation|formula)\s+not\s+provided.*", "", formula, flags=re.IGNORECASE
+    ).strip()
+    m = re.match(r"^(.+?)\s*(?:=|:)\s", formula)
+    if m:
+        return m.group(1).strip()
+    return formula.split("(")[0].strip()[:80]
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+def parse_evidence_value(ev):
+    if ev is None:
+        return "not found"
+    if isinstance(ev, (int, float)):
+        return [float(ev)]
+    ev_str = str(ev).strip()
+    if not ev_str:
+        return "not found"
+    if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", ev_str):
+        return ev_str
+    bp = re.match(r"^(\d{2,3})/(\d{2,3})\s*(.*)$", ev_str)
+    if bp:
+        systolic, diastolic, unit = float(bp.group(1)), float(bp.group(2)), bp.group(3).strip()
+        if 40 <= diastolic <= 130:
+            return [systolic, unit if unit else "mmHg"]
+    rate = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)\s*(/\s*\w+)\s*$", ev_str)
+    if rate:
+        return [float(rate.group(1)), rate.group(2).strip()]
+    num_unit = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)\s+(.+)$", ev_str)
+    if num_unit:
+        return [float(num_unit.group(1)), num_unit.group(2).strip()]
+    if re.match(r"^-?[0-9]+(?:\.[0-9]+)?$", ev_str):
+        return [float(ev_str)]
+    return ev_str
+
+
+def extract_step1_params(entities: list) -> dict:
+    params = {}
+    for e in entities:
+        name = e.get("name", "")
+        if name:
+            params[name] = parse_evidence_value(e.get("evidence_value", "not found"))
+    return params
+
+
+def _days_to_gest_tuple(total_days) -> str:
+    weeks, days = divmod(round(total_days), 7)
+    return f"('{weeks} weeks', '{days} days')"
+
+
+def _weeks_to_gest_tuple(total_weeks) -> str:
+    whole_weeks    = int(total_weeks)
+    remaining_days = round((total_weeks - whole_weeks) * 7)
+    if remaining_days == 7:
+        whole_weeks += 1
+        remaining_days = 0
+    return f"('{whole_weeks} weeks', '{remaining_days} days')"
+
+
+def _parse_gestational_age(s: str):
+    SEP = r"\s*(?:and|,|&)?\s*"
+    DPY, DPM, DPW = 365, 30, 7
+
+    m = re.match(r"^\(\s*(\d+)\s+weeks?\s*,\s*(\d+)\s+days?\s*\)$", s, re.IGNORECASE)
+    if m:
+        return f"('{m.group(1)} weeks', '{m.group(2)} days')"
+    m = re.match(r"^\(\s*(\d+)\s*,\s*(\d+)\s*\)$", s)
+    if m:
+        return f"('{m.group(1)} weeks', '{m.group(2)} days')"
+    m = re.match(r"^(\d+)\s+days?,\s*\d+:\d+:\d+$", s, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1)))
+
+    core = re.sub(r"^approximately\s+", "", s, flags=re.IGNORECASE).strip()
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s+weeks?$", core, re.IGNORECASE)
+    if m:
+        return _weeks_to_gest_tuple(float(m.group(1)))
+    m = re.match(r"^(\d+(?:\.\d+)?)\s+days?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(float(m.group(1)))
+    m = re.match(r"^(\d+)\s+weeks?" + SEP + r"(\d+)\s+days?$", core, re.IGNORECASE)
+    if m:
+        return f"('{m.group(1)} weeks', '{m.group(2)} days')"
+    m = re.match(r"^(\d+)\s+years?" + SEP + r"(\d+)\s+months?" + SEP + r"(\d+)\s+days?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPY + int(m.group(2))*DPM + int(m.group(3)))
+    m = re.match(r"^(\d+)\s+years?" + SEP + r"(\d+)\s+months?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPY + int(m.group(2))*DPM)
+    m = re.match(r"^(\d+)\s+years?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPY)
+    m = re.match(r"^(\d+)\s+months?" + SEP + r"(\d+)\s+weeks?" + SEP + r"(\d+)\s+days?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPM + int(m.group(2))*DPW + int(m.group(3)))
+    m = re.match(r"^(\d+)\s+months?" + SEP + r"(\d+)\s+weeks?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPM + int(m.group(2))*DPW)
+    m = re.match(r"^(\d+)\s+months?" + SEP + r"(\d+)\s+days?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPM + int(m.group(2)))
+    m = re.match(r"^(\d+)\s+months?$", core, re.IGNORECASE)
+    if m:
+        return _days_to_gest_tuple(int(m.group(1))*DPM)
+    return None
+
+
+def parse_computed_value(raw):
+    if raw is None:
+        return "not calculated"
+    s = str(raw).strip()
+    if not s or s.lower() in ("none", ""):
+        return "not calculated"
+    if s.lower() in ("not applicable", "n/a"):
+        return "not applicable"
+    if s.lower() in ("not calculated", "not found",
+                     "no correct result as the evidence does not match the claim"):
+        return s
+    dt = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:\s+\d{2}:\d{2}:\d{2})?$", s)
+    if dt:
+        return f"{dt.group(2)}/{dt.group(3)}/{dt.group(1)}"
+    gest = _parse_gestational_age(s)
+    if gest is not None:
+        return gest
+    if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", s):
+        return s
+    m = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)", s)
+    if m:
+        v = m.group(1)
+        return int(v) if "." not in v else float(v)
+    return s
+
+
+def _regex_entities(text: str) -> list:
+    entities = []
+    for chunk in re.findall(r"\{[^{}]*?\"name\"[^{}]*?\}", text, re.DOTALL):
+        try:
+            entities.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            name = re.search(r'"name":\s*"([^"]+)"', chunk)
+            ev   = re.search(r'"evidence_value":\s*"([^"]*)"', chunk)
+            if name and ev:
+                entities.append({"name": name.group(1), "evidence_value": ev.group(1)})
+    return entities
+
+
+def _regex_formula(text: str):
+    m = re.search(r'"formula":\s*"([^"]+)"', text)
+    return m.group(1) if m else None
+
+
+def _regex_correct_result(text: str):
+    m = re.search(r'"correct_result":\s*(?:"([^"]*)"|(-?[0-9]+(?:\.[0-9]*)?))', text)
+    if m:
+        return m.group(1) if m.group(1) is not None else m.group(2)
+    return None
+
+
+def extract_from_reasoning(reasoning) -> tuple:
+    if pd.isna(reasoning) or str(reasoning).strip() == "":
+        return "not applicable", {}, "not calculated"
+    text = str(reasoning)
+    try:
+        d          = json.loads(text)
+        entities   = d.get("step1_entities", d.get("entities", []))
+        calc_block = d.get("step2_calculation", d.get("calculation", {}))
+        formula    = calc_block.get("formula", "")
+        raw_result = calc_block.get("correct_result", None)
+    except json.JSONDecodeError:
+        entities   = _regex_entities(text)
+        formula    = _regex_formula(text)
+        raw_result = _regex_correct_result(text)
+    return (
+        extract_calculator_selected(formula),
+        extract_step1_params(entities),
+        parse_computed_value(raw_result),
+    )
+
+
+def _fill_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
+    need_calc = "calculator_selected"    not in df.columns
+    need_pe   = "step1_extracted_params" not in df.columns
+    need_qp   = "step2_computed_value"   not in df.columns
+
+    if not (need_calc or need_pe or need_qp):
+        print("[evaluate] All three columns present — skipping preprocessing.")
+        return df
+
+    missing = [c for c, flag in [
+        ("calculator_selected",    need_calc),
+        ("step1_extracted_params", need_pe),
+        ("step2_computed_value",   need_qp),
+    ] if flag]
+    print(f"[evaluate] Adding missing column(s): {missing}")
+
+    calculators, params_list, values = [], [], []
+    for _, row in df.iterrows():
+        calc, params, value = extract_from_reasoning(row["model_reasoning"])
+        calculators.append(calc)
+        params_list.append(json.dumps(params))
+        values.append(value)
+
+    df = df.copy()
+    if need_calc: df["calculator_selected"]    = calculators
+    if need_pe:   df["step1_extracted_params"] = params_list
+    if need_qp:   df["step2_computed_value"]   = values
+    return df
+
+
+# ── PART 2  Evaluation ────────────────────────────────────────────────────────
 
 def parse_relevant_entities(s):
-    """Parse the ground-truth Relevant Entities string (Python-literal dict)."""
-    try:
-        return ast.literal_eval(str(s))
-    except Exception:
-        return {}
+    try:    return ast.literal_eval(str(s))
+    except: return {}
 
 
 def parse_step1(s):
-    """Parse the model step1_extracted_params string (JSON dict)."""
-    try:
-        return json.loads(str(s))
-    except Exception:
-        try:
-            return ast.literal_eval(str(s))
-        except Exception:
-            return {}
+    try:    return json.loads(str(s))
+    except:
+        try:    return ast.literal_eval(str(s))
+        except: return {}
 
 
 def is_negatively_framed(entity_name: str) -> bool:
-    """
-    A negatively-framed entity describes absence/negation in its name.
-    Examples: 'Cough Absent', 'Absence of cough or coryza',
-              'Alternative diagnosis to DVT as likely or more likely'
-    """
     nl = entity_name.lower()
-    patterns = ["absent", "absence", "alternative diagnosis", "without", r"\bno "]
-    return any(re.search(p, nl) for p in patterns)
+    return any(re.search(p, nl) for p in
+               ["absent", "absence", "alternative diagnosis", "without", r"\bno "])
 
 
-def is_found(step1_val) -> bool:
-    """Return True if the model actually extracted a value (not 'not found')."""
-    if step1_val is None:
-        return False
-    if isinstance(step1_val, str) and step1_val.strip().lower() in (
+def is_found(v) -> bool:
+    if v is None: return False
+    if isinstance(v, str) and v.strip().lower() in (
         "not found", "not applicable", "not calculated", "n/a", ""
-    ):
-        return False
+    ): return False
     return True
 
 
-def to_bool(val) -> bool | None:
-    """Coerce various yes/no/True/False representations to Python bool."""
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return bool(val)
+def to_bool(val):
+    if isinstance(val, bool):         return val
+    if isinstance(val, (int, float)): return bool(val)
     if isinstance(val, str):
         v = val.strip().lower()
-        if v in ("true", "yes", "1"):
-            return True
-        if v in ("false", "no", "0"):
-            return False
+        if v in ("true",  "yes", "1"): return True
+        if v in ("false", "no",  "0"): return False
     return None
 
 
 def to_numeric(val):
-    """
-    Extract a float from:
-      - a number            → 4.2
-      - a list [4.2, 'unit'] → 4.2
-      - a list [4.2]         → 4.2
-      - a string '4.2'       → 4.2
-    Returns None on failure.
-    """
     try:
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, list) and len(val) >= 1:
-            return float(val[0])
+        if isinstance(val, (int, float)): return float(val)
+        if isinstance(val, list) and val: return float(val[0])
         if isinstance(val, str):
             m = re.search(r"[-+]?\d*\.?\d+", val)
-            if m:
-                return float(m.group())
-    except Exception:
-        pass
+            if m: return float(m.group())
+    except: pass
     return None
 
 
 def _normalize_entity(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r'\b(the|a|an)\b', '', s)
-    return re.sub(r'\s+', ' ', s).strip()
+    return re.sub(r'\s+', ' ', re.sub(r'\b(the|a|an)\b', '', s.lower())).strip()
 
 
 def find_key_in_step1(entity_name: str, step1_dict: dict):
-    """
-    Key lookup with two-tier matching:
-      1. Exact case-insensitive match
-      2. Fuzzy match: strip articles (the/a/an), then check substring containment
-    Returns (matched_key, value) or (None, None).
-    """
     en_lower = entity_name.lower()
-    # 1. exact
     for k, v in step1_dict.items():
-        if k.lower() == en_lower:
-            return k, v
-    # 2. fuzzy
+        if k.lower() == en_lower: return k, v
     en_norm = _normalize_entity(entity_name)
     for k, v in step1_dict.items():
         k_norm = _normalize_entity(k)
-        if k_norm == en_norm or k_norm in en_norm or en_norm in k_norm:
-            return k, v
+        if k_norm == en_norm or k_norm in en_norm or en_norm in k_norm: return k, v
     return None, None
 
 
-def entity_is_correct(entity_name: str, gt_val, step1_dict: dict) -> bool:
-    """
-    Assess whether one entity was correctly extracted.
-
-    Rules
-    ─────
-    1. Look up entity_name in step1_dict (case-insensitive).
-    2. If NOT found (missing key or value == 'not found'):
-         • Positively-framed  + gt_val is False/No  → correct
-         • Negatively-framed  + gt_val is True/Yes  → correct
-         • Otherwise                                 → incorrect
-    3. If found:
-         a. Boolean gt_val  →  compare to bool(step1_val)
-         b. Numeric gt_val  →  compare numeric values
-         c. String  gt_val  →  case-insensitive equality
-    """
+def entity_is_correct(entity_name, gt_val, step1_dict) -> bool:
     _, step1_val = find_key_in_step1(entity_name, step1_dict)
     negative = is_negatively_framed(entity_name)
-
-    # ── entity NOT found in step1 ──────────────────────────────────────────
     if not is_found(step1_val):
         if isinstance(gt_val, bool):
-            if not negative and gt_val is False:   # positively-framed, absent
-                return True
-            if negative and gt_val is True:        # negatively-framed, truly absent
-                return True
+            if not negative and gt_val is False: return True
+            if negative     and gt_val is True:  return True
         elif isinstance(gt_val, str):
-            gt_bool = to_bool(gt_val)
-            if gt_bool is not None:
-                if not negative and gt_bool is False:
-                    return True
-                if negative and gt_bool is True:
-                    return True
-        return False   # all other not-found cases are incorrect
-
-    # ── entity IS found in step1 ──────────────────────────────────────────
-
-    # Case A: ground truth is boolean
+            gb = to_bool(gt_val)
+            if gb is not None:
+                if not negative and gb is False: return True
+                if negative     and gb is True:  return True
+        return False
     if isinstance(gt_val, bool):
-        step1_bool = to_bool(step1_val)
-        if step1_bool is None:
-            return False
-        return gt_val == step1_bool
-
-    # Case B: ground truth is a numeric list  [value, unit]
-    if isinstance(gt_val, list) and len(gt_val) >= 1 and isinstance(gt_val[0], (int, float)):
-        gt_num = float(gt_val[0])
-        s1_num = to_numeric(step1_val)
-        if s1_num is None:
-            return False
-        # allow a tiny floating-point tolerance
-        return abs(gt_num - s1_num) <= 1e-6 * max(1, abs(gt_num))
-
-    # Case C: ground truth is a plain string (e.g. '0.0')
+        sb = to_bool(step1_val)
+        return sb is not None and gt_val == sb
+    if isinstance(gt_val, list) and gt_val and isinstance(gt_val[0], (int, float)):
+        sn = to_numeric(step1_val)
+        return sn is not None and abs(float(gt_val[0]) - sn) <= 1e-6 * max(1, abs(float(gt_val[0])))
     if isinstance(gt_val, str):
-        gt_bool = to_bool(gt_val)
-        step1_bool = to_bool(step1_val)
-        if gt_bool is not None and step1_bool is not None:
-            return gt_bool == step1_bool
-        gt_num = to_numeric(gt_val)
-        s1_num = to_numeric(step1_val)
-        if gt_num is not None and s1_num is not None:
-            return abs(gt_num - s1_num) <= 1e-6 * max(1, abs(gt_num))
-        # fall back to string equality
+        gb, sb = to_bool(gt_val), to_bool(step1_val)
+        if gb is not None and sb is not None: return gb == sb
+        gn, sn = to_numeric(gt_val), to_numeric(step1_val)
+        if gn is not None and sn is not None:
+            return abs(gn - sn) <= 1e-6 * max(1, abs(gn))
         return str(gt_val).strip().lower() == str(step1_val).strip().lower()
-
     return False
 
 
-# ── Calculator name → ID resolver ────────────────────────────────────────────
+# ── Calculator ID resolver ────────────────────────────────────────────────────
 
 _CALCULATOR_LIST = """
 ID 2  — Creatinine Clearance (Cockcroft-Gault Equation): age, creatinine, height, sex, weight
@@ -320,7 +436,6 @@ _CALC_ALIASES: dict = {
     "curb-65 score": 45, "curb65": 45,
     "cha2ds2-vasc score": 4, "cha2ds2 vasc": 4,
     "10-year risk percentage of mi or death": 46,
-    "estimated date of conception": 68, "estimated of conception": 68,
 }
 
 _MATCH_STOP = frozenset({
@@ -330,309 +445,251 @@ _MATCH_STOP = frozenset({
 })
 
 _CALC_NAME_TO_ID: dict = {}
-
-# Counters for each matching tier
-_CS_MATCH_STATS: dict = {
-    "exact":     0,
-    "alias":     0,
-    "substring": 0,
-    "word_overlap": 0,
-    "no_match":  0,
-}
+_CS_MATCH_STATS: dict  = {"exact": 0, "alias": 0, "substring": 0, "word_overlap": 0, "no_match": 0}
 
 
 def _build_name_to_id() -> dict:
     mapping: dict = {}
     for line in _CALCULATOR_LIST.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"ID\s+(\d+)\s+[—–-]+\s+(.+?)(?::|$)", line)
+        m = re.match(r"ID\s+(\d+)\s+[—–-]+\s+(.+?)(?::|$)", line.strip())
         if m:
             mapping[m.group(2).strip().lower()] = int(m.group(1))
     return mapping
 
 
-def _resolve_calculator_id(calc_name: str) -> tuple[int, str]:
-    """Returns (calculator_id, match_tier)."""
+def _resolve_calculator_id(calc_name: str) -> tuple:
     global _CALC_NAME_TO_ID
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
     key = calc_name.lower().strip()
     if key in _CALC_NAME_TO_ID:
-        _CS_MATCH_STATS["exact"] += 1
-        return _CALC_NAME_TO_ID[key], "exact"
+        _CS_MATCH_STATS["exact"] += 1;        return _CALC_NAME_TO_ID[key], "exact"
     if key in _CALC_ALIASES:
-        _CS_MATCH_STATS["alias"] += 1
-        return _CALC_ALIASES[key], "alias"
+        _CS_MATCH_STATS["alias"] += 1;        return _CALC_ALIASES[key], "alias"
     for alias, cid in _CALC_ALIASES.items():
         if alias in key or key in alias:
-            _CS_MATCH_STATS["alias"] += 1
-            return cid, "alias"
+            _CS_MATCH_STATS["alias"] += 1;    return cid, "alias"
     for name, cid in sorted(_CALC_NAME_TO_ID.items(), key=lambda x: len(x[0]), reverse=True):
         if name in key or key in name:
-            _CS_MATCH_STATS["substring"] += 1
-            return cid, "substring"
+            _CS_MATCH_STATS["substring"] += 1; return cid, "substring"
     key_words = set(re.findall(r'[a-z0-9]+', key)) - _MATCH_STOP
     best_cid, best_overlap = 0, 0
     for name, cid in _CALC_NAME_TO_ID.items():
-        name_words = set(re.findall(r'[a-z0-9]+', name)) - _MATCH_STOP
-        overlap = len(key_words & name_words)
+        overlap = len(key_words & (set(re.findall(r'[a-z0-9]+', name)) - _MATCH_STOP))
         if overlap > best_overlap:
             best_overlap, best_cid = overlap, cid
     if best_overlap >= 2:
-        _CS_MATCH_STATS["word_overlap"] += 1
-        return best_cid, "word_overlap"
-    _CS_MATCH_STATS["no_match"] += 1
-    return 0, "no_match"
+        _CS_MATCH_STATS["word_overlap"] += 1; return best_cid, "word_overlap"
+    _CS_MATCH_STATS["no_match"] += 1;         return 0, "no_match"
 
 
-# ── 0. TF – Task Fulfillment ──────────────────────────────────────────────────
+# ── Metric computers ──────────────────────────────────────────────────────────
 
-def compute_tf(llm_row) -> bool:
-    return str(llm_row["predicted_label"]).strip().lower() != "unknown"
-
-
-# ── 1. CS – Calculator Selection ──────────────────────────────────────────────
-
-def compute_cs(mrt_row, llm_row) -> tuple[bool, str]:
-    """Returns (is_correct, match_tier)."""
-    gt_id          = int(mrt_row["Calculator ID"])
-    pred_id, tier  = _resolve_calculator_id(str(llm_row["calculator_selected"]))
-    return gt_id == pred_id, tier
+def compute_tf(row) -> bool:
+    return str(row["predicted_label"]).strip().lower() != "unknown"
 
 
-# ── 2. PE – Parameter Extraction ─────────────────────────────────────────────
-
-def compute_pe(mrt_row, llm_row) -> bool:
-    gt_entities = parse_relevant_entities(mrt_row["Relevant Entities"])
-    step1       = parse_step1(llm_row["step1_extracted_params"])
-
-    if not gt_entities:          # nothing to evaluate → skip
-        return np.nan
-
-    all_correct = True
-    for entity_name, gt_val in gt_entities.items():
-        if not entity_is_correct(entity_name, gt_val, step1):
-            all_correct = False
-            break
-    return all_correct
+def compute_cs(mrt_row, llm_row):
+    pred_id, tier = _resolve_calculator_id(str(llm_row["calculator_selected"]))
+    return int(mrt_row["Calculator ID"]) == pred_id, tier
 
 
-# ── 3. QP – Quantitative Precision ───────────────────────────────────────────
+def compute_pe(mrt_row, llm_row):
+    gt = parse_relevant_entities(mrt_row["Relevant Entities"])
+    s1 = parse_step1(llm_row["step1_extracted_params"])
+    if not gt: return np.nan
+    return all(entity_is_correct(n, v, s1) for n, v in gt.items())
+
 
 def _compare_dates(pred_str: str, gt_str: str) -> bool:
-    """Compare date strings after normalizing to date objects."""
+    """Compare date strings; tries both MM/DD/YYYY and DD/MM/YYYY for ambiguous pred dates."""
     try:
-        return dateparser.parse(pred_str).date() == dateparser.parse(gt_str).date()
+        gt_date = dateparser.parse(gt_str).date()
     except Exception:
         return False
+    try:
+        if dateparser.parse(pred_str).date() == gt_date:
+            return True
+    except Exception:
+        pass
+    try:
+        if datetime.strptime(pred_str, "%d/%m/%Y").date() == gt_date:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _compare_gestational_age(pred_str: str, gt_str: str) -> bool:
-    """Compare gestational age strings like \"('28 weeks', '4 days')\" by total days."""
     try:
         def to_days(s):
             t = ast.literal_eval(s)
-            weeks = int(re.search(r'\d+', t[0]).group())
-            days  = int(re.search(r'\d+', t[1]).group())
-            return weeks * 7 + days
+            return int(re.search(r'\d+', t[0]).group()) * 7 + int(re.search(r'\d+', t[1]).group())
         return to_days(pred_str) == to_days(gt_str)
-    except Exception:
-        return False
+    except: return False
 
 
 def compute_qp(mrt_row, llm_row) -> bool:
-    step2_raw = str(llm_row["step2_computed_value"]).strip()
-    gt_lo     = str(mrt_row["Lower Limit"]).strip()
-    gt_hi     = str(mrt_row["Upper Limit"]).strip()
-
-    # numeric path
+    s2 = str(llm_row["step2_computed_value"]).strip()
+    lo = str(mrt_row["Lower Limit"]).strip()
+    hi = str(mrt_row["Upper Limit"]).strip()
     try:
-        lo = float(gt_lo)
-        hi = float(gt_hi)
-        step2_num = to_numeric(step2_raw)
-        if step2_num is None:
-            return False
-        return lo <= step2_num <= hi
-    except (ValueError, TypeError):
-        pass
-
-    # gestational age path: "('28 weeks', '4 days')"
-    if gt_lo.startswith("("):
-        return _compare_gestational_age(step2_raw, gt_lo)
-
-    # date path
-    return _compare_dates(step2_raw, gt_lo)
+        n = to_numeric(s2)
+        if n is None: return False
+        return float(lo) <= n <= float(hi)
+    except (ValueError, TypeError): pass
+    if lo.startswith("("): return _compare_gestational_age(s2, lo)
+    return _compare_dates(s2, lo)
 
 
-# ── Classification metrics (Precision / Recall / F1) ─────────────────────────
+# ── Classification metrics ────────────────────────────────────────────────────
 
 def compute_metrics(true_labels, pred_labels):
-    """
-    Compute per-class and aggregate P, R, F1.
-
-    Unknown predictions are kept as wrong predictions (penalized) rather than
-    skipped. They never match any true label, so they contribute to FP/FN.
-    """
-    unknown_count = sum(1 for p in pred_labels if p == "unknown")
     classes = sorted(set(true_labels))
-    n = len(true_labels)
-
+    n       = len(true_labels)
     per_class = {}
     for cls in classes:
-        tp = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p == cls)
-        fp = sum(1 for t, p in zip(true_labels, pred_labels) if t != cls and p == cls)
-        fn = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p != cls)
+        tp      = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p == cls)
+        fp      = sum(1 for t, p in zip(true_labels, pred_labels) if t != cls and p == cls)
+        fn      = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p != cls)
         support = sum(1 for t in true_labels if t == cls)
-
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)
-              if (precision + recall) > 0 else 0.0)
-
-        per_class[cls] = {
-            "precision": precision, "recall": recall, "f1": f1,
-            "support": support, "tp": tp, "fp": fp, "fn": fn,
-        }
-
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) else 0.0
+        f1   = 2*prec*rec / (prec+rec) if (prec+rec) else 0.0
+        per_class[cls] = {"precision": prec, "recall": rec, "f1": f1, "support": support}
     macro_p  = sum(v["precision"] for v in per_class.values()) / len(classes)
     macro_r  = sum(v["recall"]    for v in per_class.values()) / len(classes)
     macro_f1 = sum(v["f1"]        for v in per_class.values()) / len(classes)
-
-    total_support = sum(v["support"] for v in per_class.values())
-    weighted_p  = sum(v["precision"] * v["support"] for v in per_class.values()) / total_support
-    weighted_r  = sum(v["recall"]    * v["support"] for v in per_class.values()) / total_support
-    weighted_f1 = sum(v["f1"]        * v["support"] for v in per_class.values()) / total_support
-
-    accuracy = sum(1 for t, p in zip(true_labels, pred_labels) if t == p) / n if n else 0.0
-
+    total    = sum(v["support"]   for v in per_class.values())
+    w_p  = sum(v["precision"]*v["support"] for v in per_class.values()) / total
+    w_r  = sum(v["recall"]   *v["support"] for v in per_class.values()) / total
+    w_f1 = sum(v["f1"]       *v["support"] for v in per_class.values()) / total
+    acc  = sum(1 for t, p in zip(true_labels, pred_labels) if t == p) / n if n else 0.0
     return {
         "per_class": per_class,
-        "macro":    {"precision": macro_p,    "recall": macro_r,    "f1": macro_f1},
-        "weighted": {"precision": weighted_p, "recall": weighted_r, "f1": weighted_f1},
-        "accuracy": accuracy,
-        "n_total": n,
-        "n_unknown": unknown_count,
+        "macro":    {"precision": macro_p, "recall": macro_r, "f1": macro_f1},
+        "weighted": {"precision": w_p,     "recall": w_r,     "f1": w_f1},
+        "accuracy": acc,
+        "n_total":   n,
+        "n_unknown": sum(1 for p in pred_labels if p == "unknown"),
     }
 
 
-def print_classification_report(name, results):
-    pc = results["per_class"]
-    classes = sorted(pc.keys())
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    print(f"\n{'='*60}")
-    print(f"  Classification Report – {name}")
-    print(f"{'='*60}")
-    print(f"  Total samples : {results['n_total']}")
-    print(f"  Unknown preds : {results['n_unknown']} (treated as wrong)")
-    print(f"  Accuracy      : {results['accuracy']:.4f}")
-    print()
-
-    col_w = max(len(c) for c in classes) + 2
-    header = f"  {'Class':<{col_w}}  {'Precision':>10}  {'Recall':>10}  {'F1':>10}  {'Support':>8}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for cls in classes:
-        v = pc[cls]
-        print(f"  {cls:<{col_w}}  {v['precision']:>10.4f}  {v['recall']:>10.4f}  {v['f1']:>10.4f}  {v['support']:>8}")
-
-    print()
-    print(f"  {'Macro avg':<{col_w}}  {results['macro']['precision']:>10.4f}  {results['macro']['recall']:>10.4f}  {results['macro']['f1']:>10.4f}")
-    print(f"  {'Weighted avg':<{col_w}}  {results['weighted']['precision']:>10.4f}  {results['weighted']['recall']:>10.4f}  {results['weighted']['f1']:>10.4f}")
-    print()
+def _qp_is_missing(llm_row) -> bool:
+    s = str(llm_row["step2_computed_value"]).strip().lower()
+    return s in ("not calculated", "not found", "nan", "", "none", "not applicable", "n/a")
 
 
-def run_evaluation(llm_path):
-    # Reset match stats for this run
-    for k in _CS_MATCH_STATS:
-        _CS_MATCH_STATS[k] = 0
+def _pe_is_unparseable(llm_row) -> bool:
+    return parse_step1(llm_row["step1_extracted_params"]) == {}
 
-    llm = pd.read_csv(llm_path)
-    assert len(mrt) == len(llm), f"Row count mismatch: {llm_path}"
-    n = len(mrt)
 
-    has_cs = "calculator_selected" in llm.columns
+def _derive_name(path: str) -> str:
+    stem = re.split(r'[/\\]', path)[-1]
+    return re.sub(r'\.csv$', '', stem, flags=re.IGNORECASE)
+
+
+# ── Combined report ───────────────────────────────────────────────────────────
+
+def run_evaluation(llm: pd.DataFrame, mrt: pd.DataFrame, label: str, name: str = None):
+    for k in _CS_MATCH_STATS: _CS_MATCH_STATS[k] = 0
+    assert len(mrt) == len(llm), (
+        f"Row count mismatch: ground truth {len(mrt)} rows, result {len(llm)} rows."
+    )
+
+    name   = name or _derive_name(label)
+    n      = len(mrt)
+    has_cs = "calculator_selected"    in llm.columns
     has_pe = "step1_extracted_params" in llm.columns
-    has_qp = "step2_computed_value" in llm.columns
+    has_qp = "step2_computed_value"   in llm.columns
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    tf_list, cs_list, pe_list, qp_list = [], [], [], []
+    pe_unparseable = 0
+    qp_missing     = 0
 
-    results = []
     for i in range(n):
-        mrt_row = mrt.iloc[i]
-        llm_row = llm.iloc[i]
-
-        tf            = compute_tf(llm_row)
-        cs, tier      = compute_cs(mrt_row, llm_row) if has_cs else (np.nan, "n/a")
-        pe            = compute_pe(mrt_row, llm_row)  if has_pe else np.nan
-        qp            = compute_qp(mrt_row, llm_row)  if has_qp else np.nan
-
-        results.append({
-            "row_idx":        i,
-            "mrt_row_number": mrt_row["Row Number"],
-            "calculator_gt":  mrt_row["Calculator Name"],
-            "calculator_pred": llm_row["calculator_selected"] if has_cs else np.nan,
-            "TF":   tf,
-            "CS":   cs,   "CS_tier": tier,
-            "PE":   pe,
-            "QP":   qp,
-        })
-
-    results_df = pd.DataFrame(results)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-
-    tf_acc    = results_df["TF"].mean()
-    pe_valid  = results_df["PE"].dropna()
-    qp_series = results_df["QP"].dropna()
-
-    print("=" * 52)
-    print(f"  {llm_path}")
-    print("=" * 52)
-    print(f"  Total rows evaluated : {n}")
-    print()
-    print(f"  TF (Task Fulfillment)")
-    print(f"    Success  : {results_df['TF'].sum():.0f} / {n}")
-    print(f"    Accuracy : {tf_acc:.4f}  ({tf_acc*100:.2f}%)")
-    print()
-    if has_cs:
-        cs_acc = results_df["CS"].mean()
-        print(f"  CS (Calculator Selection)")
-        print(f"    Correct  : {results_df['CS'].sum():.0f} / {n}")
-        print(f"    Accuracy : {cs_acc:.4f}  ({cs_acc*100:.2f}%)")
-        print(f"    Match breakdown:")
-        total_matched = sum(_CS_MATCH_STATS.values())
-        for tier, count in _CS_MATCH_STATS.items():
-            pct = count / total_matched * 100 if total_matched else 0
-            print(f"      {tier:<12} : {count:>5}  ({pct:.1f}%)")
-        print()
-    if has_pe:
-        print(f"  PE (Parameter Extraction)")
-        print(f"    Correct  : {pe_valid.sum():.0f} / {n}")
-        print(f"    Accuracy : {pe_valid.sum()/n:.4f}  ({pe_valid.sum()/n*100:.2f}%)")
-        print()
-    if has_qp:
-        print(f"  QP (Quantitative Precision)")
-        print(f"    Correct  : {qp_series.sum():.0f} / {n}")
-        print(f"    Accuracy : {qp_series.sum()/n:.4f}  ({qp_series.sum()/n*100:.2f}%)")
-    print("=" * 52)
-
-    # ── Classification metrics ─────────────────────────────────────────────────
+        mrt_row, llm_row = mrt.iloc[i], llm.iloc[i]
+        tf_list.append(compute_tf(llm_row))
+        if has_cs:
+            cs_list.append(compute_cs(mrt_row, llm_row))
+        if has_pe:
+            if _pe_is_unparseable(llm_row): pe_unparseable += 1
+            pe_list.append(compute_pe(mrt_row, llm_row))
+        if has_qp:
+            if _qp_is_missing(llm_row): qp_missing += 1
+            qp_list.append(compute_qp(mrt_row, llm_row))
 
     true_labels = llm["true_label"].str.strip().str.lower().tolist()
     pred_labels = llm["predicted_label"].str.strip().str.lower().tolist()
-    clf_results = compute_metrics(true_labels, pred_labels)
-    print_classification_report(llm_path, clf_results)
+    clf         = compute_metrics(true_labels, pred_labels)
+    pc          = clf["per_class"]
+    classes     = sorted(pc.keys())
+    col_w       = max(len(c) for c in classes) + 2
+    W           = 60
+
+    print("=" * W)
+    print(f"  {name}")
+    print("=" * W)
+    print(f"  Total samples : {n}")
+    print(f"  Unknown preds : {clf['n_unknown']} (treated as wrong)")
+    print(f"  Accuracy      : {clf['accuracy']:.4f}")
+    print()
+
+    hdr = f"  {'Class':<{col_w}}  {'Precision':>10}  {'Recall':>10}  {'F1':>10}  {'Support':>8}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for cls in classes:
+        v = pc[cls]
+        print(f"  {cls:<{col_w}}  {v['precision']:>10.4f}  {v['recall']:>10.4f}"
+              f"  {v['f1']:>10.4f}  {v['support']:>8}")
+    print()
+    print(f"  {'Macro avg':<{col_w}}  {clf['macro']['precision']:>10.4f}"
+          f"  {clf['macro']['recall']:>10.4f}  {clf['macro']['f1']:>10.4f}")
+    print(f"  {'Weighted avg':<{col_w}}  {clf['weighted']['precision']:>10.4f}"
+          f"  {clf['weighted']['recall']:>10.4f}  {clf['weighted']['f1']:>10.4f}")
+    print()
+
+    print(f"  --- Paper Metrics ({name}) ---")
+    tf_ok = sum(tf_list)
+    print(f"  TF (Task Fulfillment)       : {tf_ok/n*100:.2f}%  ({tf_ok}/{n} tasks with valid output)")
+    if has_cs:
+        cs_ok = sum(c for c, _ in cs_list)
+        print(f"  CS (Calculator Selection)   : {cs_ok/n*100:.2f}%  ({cs_ok}/{n} correct)")
+    if has_pe:
+        pe_ok = int(pd.Series(pe_list).dropna().sum())
+        print(f"  PE (Parameter Extraction)   : {pe_ok/n*100:.2f}%  "
+              f"({pe_ok}/{n} rows fully correct, {pe_unparseable} unparseable)")
+    if has_qp:
+        qp_ok = int(pd.Series(qp_list).dropna().sum())
+        print(f"  QP (Quantitative Precision) : {qp_ok/n*100:.2f}%  "
+              f"({qp_ok}/{n} within tolerance, {qp_missing} missing/unparseable)")
+    print("=" * W)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if args.all:
-    import glob
-    files = sorted(glob.glob("results/**/*.csv", recursive=True))
-    print(f"Found {len(files)} CSV files under results/\n")
-    for f in files:
-        run_evaluation(f)
-else:
-    run_evaluation(args.result_file)
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="Preprocess (add missing columns) then evaluate a model result CSV."
+    )
+    ap.add_argument("result_file",
+                    help="Model result CSV.")
+    ap.add_argument("--gt", default="mrt_claim_cleaned.csv",
+                    help="Ground-truth CSV (default: mrt_claim_cleaned.csv).")
+    ap.add_argument("--name", default=None,
+                    help="Display name for the model (default: derived from filename).")
+    ap.add_argument("--save", metavar="OUTPUT_CSV",
+                    help="Save the preprocessed CSV to this path before evaluating.")
+    args = ap.parse_args()
+
+    llm = pd.read_csv(args.result_file)
+    llm = _fill_missing_columns(llm)
+
+    if args.save:
+        llm.to_csv(args.save, index=False)
+        print(f"[evaluate] Saved preprocessed CSV → {args.save}")
+
+    mrt = pd.read_csv(args.gt)
+    run_evaluation(llm, mrt, label=args.result_file, name=args.name)
