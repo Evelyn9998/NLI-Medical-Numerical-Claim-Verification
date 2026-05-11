@@ -14,6 +14,7 @@ Both files are row-aligned (same order, 2814 rows each).
 import ast
 import json
 import re
+from dateutil import parser as dateparser
 import re
 import warnings
 import pandas as pd
@@ -388,19 +389,49 @@ def compute_pe(mrt_row, llm_row) -> bool:
 
 # ── 3. QP – Quantitative Precision ───────────────────────────────────────────
 
+def _compare_dates(pred_str: str, gt_str: str) -> bool:
+    """Compare date strings after normalizing to date objects."""
+    try:
+        return dateparser.parse(pred_str).date() == dateparser.parse(gt_str).date()
+    except Exception:
+        return False
+
+
+def _compare_gestational_age(pred_str: str, gt_str: str) -> bool:
+    """Compare gestational age strings like \"('28 weeks', '4 days')\" by total days."""
+    try:
+        def to_days(s):
+            t = ast.literal_eval(s)
+            weeks = int(re.search(r'\d+', t[0]).group())
+            days  = int(re.search(r'\d+', t[1]).group())
+            return weeks * 7 + days
+        return to_days(pred_str) == to_days(gt_str)
+    except Exception:
+        return False
+
+
 def compute_qp(mrt_row, llm_row) -> bool:
     step2_raw = str(llm_row["step2_computed_value"]).strip()
-    step2_num = to_numeric(step2_raw)
-    if step2_num is None:
-        return False   # no numeric value produced
+    gt_lo     = str(mrt_row["Lower Limit"]).strip()
+    gt_hi     = str(mrt_row["Upper Limit"]).strip()
 
+    # numeric path
     try:
-        lo = float(mrt_row["Lower Limit"])
-        hi = float(mrt_row["Upper Limit"])
+        lo = float(gt_lo)
+        hi = float(gt_hi)
+        step2_num = to_numeric(step2_raw)
+        if step2_num is None:
+            return False
+        return lo <= step2_num <= hi
     except (ValueError, TypeError):
-        return np.nan
+        pass
 
-    return lo <= step2_num <= hi
+    # gestational age path: "('28 weeks', '4 days')"
+    if gt_lo.startswith("("):
+        return _compare_gestational_age(step2_raw, gt_lo)
+
+    # date path
+    return _compare_dates(step2_raw, gt_lo)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -455,7 +486,6 @@ print(f"    Accuracy : {pe_valid.sum()/n:.4f}  ({pe_valid.sum()/n*100:.2f}%)")
 print()
 print(f"  QP (Quantitative Precision)")
 qp_series = results_df["QP"].dropna()
-qp_n = len(qp_series)
-print(f"    Correct  : {qp_series.sum():.0f} / {qp_n}  (excluding {n - qp_n} date-based rows)")
-print(f"    Accuracy : {qp_series.mean():.4f}  ({qp_series.mean()*100:.2f}%)")
+print(f"    Correct  : {qp_series.sum():.0f} / {n}")
+print(f"    Accuracy : {qp_series.sum()/n:.4f}  ({qp_series.sum()/n*100:.2f}%)")
 print("=" * 52)
