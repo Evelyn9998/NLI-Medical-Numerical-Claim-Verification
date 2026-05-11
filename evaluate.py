@@ -1,21 +1,33 @@
 """
-Evaluation script for three indicators:
-  CS  – Calculator Selection
-  PE  – Parameter Extraction
-  QP  – Quantitative Precision
+Evaluation script for NLI Medical Numerical Verification results.
 
-Inputs:
-  mrt_claim_cleaned.csv              (ground truth)
-  01_zs_cot_llama_processed_filled.csv  (model output)
+Indicators
+──────────
+  TF  – Task Fulfillment        : % of rows with a valid (non-unknown) predicted label
+  CS  – Calculator Selection    : % of rows where the correct calculator was identified
+  PE  – Parameter Extraction    : % of rows where all required parameters were correctly extracted
+  QP  – Quantitative Precision  : % of rows where the computed value falls within [Lower, Upper]
+
+Classification Metrics (label-level)
+─────────────────────────────────────
+  Per-class    Precision, Recall, F1, Support
+  Macro avg    unweighted mean over classes
+  Weighted avg weighted by per-class support
+  Accuracy     overall exact-match rate; unknown predictions counted as wrong
+
+Inputs
+──────
+  mrt_claim_cleaned.csv                  (ground truth)
+  01_zs_cot_llama_processed_filled.csv   (model output)
 
 Both files are row-aligned (same order, 2814 rows each).
 """
 
+import argparse
 import ast
 import json
 import re
 from dateutil import parser as dateparser
-import re
 import warnings
 import pandas as pd
 import numpy as np
@@ -23,11 +35,14 @@ import numpy as np
 warnings.filterwarnings("ignore")
 
 # ── 0. Load data ──────────────────────────────────────────────────────────────
-mrt = pd.read_csv("mrt_claim_cleaned.csv")
-llm = pd.read_csv("01_zs_cot_llama_processed_filled.csv")
+parser = argparse.ArgumentParser()
+parser.add_argument("result_file", nargs="?", default="results/2_zs_cot/processed/zs_cot_gpt_processed.csv",
+                    help="Path to model result CSV (default: zs_cot_gpt_processed.csv)")
+parser.add_argument("--all", action="store_true",
+                    help="Run evaluation on every CSV file found under results/")
+args = parser.parse_args()
 
-assert len(mrt) == len(llm), "Row count mismatch between the two files!"
-n = len(mrt)
+mrt = pd.read_csv("mrt_claim_cleaned.csv")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -316,6 +331,15 @@ _MATCH_STOP = frozenset({
 
 _CALC_NAME_TO_ID: dict = {}
 
+# Counters for each matching tier
+_CS_MATCH_STATS: dict = {
+    "exact":     0,
+    "alias":     0,
+    "substring": 0,
+    "word_overlap": 0,
+    "no_match":  0,
+}
+
 
 def _build_name_to_id() -> dict:
     mapping: dict = {}
@@ -329,21 +353,26 @@ def _build_name_to_id() -> dict:
     return mapping
 
 
-def _resolve_calculator_id(calc_name: str) -> int:
+def _resolve_calculator_id(calc_name: str) -> tuple[int, str]:
+    """Returns (calculator_id, match_tier)."""
     global _CALC_NAME_TO_ID
     if not _CALC_NAME_TO_ID:
         _CALC_NAME_TO_ID = _build_name_to_id()
     key = calc_name.lower().strip()
     if key in _CALC_NAME_TO_ID:
-        return _CALC_NAME_TO_ID[key]
+        _CS_MATCH_STATS["exact"] += 1
+        return _CALC_NAME_TO_ID[key], "exact"
     if key in _CALC_ALIASES:
-        return _CALC_ALIASES[key]
+        _CS_MATCH_STATS["alias"] += 1
+        return _CALC_ALIASES[key], "alias"
     for alias, cid in _CALC_ALIASES.items():
         if alias in key or key in alias:
-            return cid
-    for name, cid in _CALC_NAME_TO_ID.items():
+            _CS_MATCH_STATS["alias"] += 1
+            return cid, "alias"
+    for name, cid in sorted(_CALC_NAME_TO_ID.items(), key=lambda x: len(x[0]), reverse=True):
         if name in key or key in name:
-            return cid
+            _CS_MATCH_STATS["substring"] += 1
+            return cid, "substring"
     key_words = set(re.findall(r'[a-z0-9]+', key)) - _MATCH_STOP
     best_cid, best_overlap = 0, 0
     for name, cid in _CALC_NAME_TO_ID.items():
@@ -352,8 +381,10 @@ def _resolve_calculator_id(calc_name: str) -> int:
         if overlap > best_overlap:
             best_overlap, best_cid = overlap, cid
     if best_overlap >= 2:
-        return best_cid
-    return 0
+        _CS_MATCH_STATS["word_overlap"] += 1
+        return best_cid, "word_overlap"
+    _CS_MATCH_STATS["no_match"] += 1
+    return 0, "no_match"
 
 
 # ── 0. TF – Task Fulfillment ──────────────────────────────────────────────────
@@ -364,10 +395,11 @@ def compute_tf(llm_row) -> bool:
 
 # ── 1. CS – Calculator Selection ──────────────────────────────────────────────
 
-def compute_cs(mrt_row, llm_row) -> bool:
-    gt_id   = int(mrt_row["Calculator ID"])
-    pred_id = _resolve_calculator_id(str(llm_row["calculator_selected"]))
-    return gt_id == pred_id
+def compute_cs(mrt_row, llm_row) -> tuple[bool, str]:
+    """Returns (is_correct, match_tier)."""
+    gt_id          = int(mrt_row["Calculator ID"])
+    pred_id, tier  = _resolve_calculator_id(str(llm_row["calculator_selected"]))
+    return gt_id == pred_id, tier
 
 
 # ── 2. PE – Parameter Extraction ─────────────────────────────────────────────
@@ -434,58 +466,173 @@ def compute_qp(mrt_row, llm_row) -> bool:
     return _compare_dates(step2_raw, gt_lo)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Classification metrics (Precision / Recall / F1) ─────────────────────────
 
-results = []
-for i in range(n):
-    mrt_row = mrt.iloc[i]
-    llm_row = llm.iloc[i]
+def compute_metrics(true_labels, pred_labels):
+    """
+    Compute per-class and aggregate P, R, F1.
 
-    tf = compute_tf(llm_row)
-    cs = compute_cs(mrt_row, llm_row)
-    pe = compute_pe(mrt_row, llm_row)
-    qp = compute_qp(mrt_row, llm_row)
+    Unknown predictions are kept as wrong predictions (penalized) rather than
+    skipped. They never match any true label, so they contribute to FP/FN.
+    """
+    unknown_count = sum(1 for p in pred_labels if p == "unknown")
+    classes = sorted(set(true_labels))
+    n = len(true_labels)
 
-    results.append({
-        "row_idx":           i,
-        "mrt_row_number":    mrt_row["Row Number"],
-        "calculator_gt":     mrt_row["Calculator Name"],
-        "calculator_pred":   llm_row["calculator_selected"],
-        "TF":                tf,
-        "CS":                cs,
-        "PE":                pe,
-        "QP":                qp,
-    })
+    per_class = {}
+    for cls in classes:
+        tp = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p == cls)
+        fp = sum(1 for t, p in zip(true_labels, pred_labels) if t != cls and p == cls)
+        fn = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p != cls)
+        support = sum(1 for t in true_labels if t == cls)
 
-results_df = pd.DataFrame(results)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)
+              if (precision + recall) > 0 else 0.0)
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+        per_class[cls] = {
+            "precision": precision, "recall": recall, "f1": f1,
+            "support": support, "tp": tp, "fp": fp, "fn": fn,
+        }
 
-tf_acc = results_df["TF"].mean()
-cs_acc = results_df["CS"].mean()
-pe_valid = results_df["PE"].dropna()
-pe_acc = pe_valid.mean()
-qp_acc = results_df["QP"].dropna().mean()
+    macro_p  = sum(v["precision"] for v in per_class.values()) / len(classes)
+    macro_r  = sum(v["recall"]    for v in per_class.values()) / len(classes)
+    macro_f1 = sum(v["f1"]        for v in per_class.values()) / len(classes)
 
-print("=" * 52)
-print("  Indicator Summary")
-print("=" * 52)
-print(f"  Total rows evaluated : {n}")
-print()
-print(f"  TF (Task Fulfillment)")
-print(f"    Success  : {results_df['TF'].sum():.0f} / {n}")
-print(f"    Accuracy : {tf_acc:.4f}  ({tf_acc*100:.2f}%)")
-print()
-print(f"  CS (Calculator Selection)")
-print(f"    Correct  : {results_df['CS'].sum():.0f} / {n}")
-print(f"    Accuracy : {cs_acc:.4f}  ({cs_acc*100:.2f}%)")
-print()
-print(f"  PE (Parameter Extraction)")
-print(f"    Correct  : {pe_valid.sum():.0f} / {n}")
-print(f"    Accuracy : {pe_valid.sum()/n:.4f}  ({pe_valid.sum()/n*100:.2f}%)")
-print()
-print(f"  QP (Quantitative Precision)")
-qp_series = results_df["QP"].dropna()
-print(f"    Correct  : {qp_series.sum():.0f} / {n}")
-print(f"    Accuracy : {qp_series.sum()/n:.4f}  ({qp_series.sum()/n*100:.2f}%)")
-print("=" * 52)
+    total_support = sum(v["support"] for v in per_class.values())
+    weighted_p  = sum(v["precision"] * v["support"] for v in per_class.values()) / total_support
+    weighted_r  = sum(v["recall"]    * v["support"] for v in per_class.values()) / total_support
+    weighted_f1 = sum(v["f1"]        * v["support"] for v in per_class.values()) / total_support
+
+    accuracy = sum(1 for t, p in zip(true_labels, pred_labels) if t == p) / n if n else 0.0
+
+    return {
+        "per_class": per_class,
+        "macro":    {"precision": macro_p,    "recall": macro_r,    "f1": macro_f1},
+        "weighted": {"precision": weighted_p, "recall": weighted_r, "f1": weighted_f1},
+        "accuracy": accuracy,
+        "n_total": n,
+        "n_unknown": unknown_count,
+    }
+
+
+def print_classification_report(name, results):
+    pc = results["per_class"]
+    classes = sorted(pc.keys())
+
+    print(f"\n{'='*60}")
+    print(f"  Classification Report – {name}")
+    print(f"{'='*60}")
+    print(f"  Total samples : {results['n_total']}")
+    print(f"  Unknown preds : {results['n_unknown']} (treated as wrong)")
+    print(f"  Accuracy      : {results['accuracy']:.4f}")
+    print()
+
+    col_w = max(len(c) for c in classes) + 2
+    header = f"  {'Class':<{col_w}}  {'Precision':>10}  {'Recall':>10}  {'F1':>10}  {'Support':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for cls in classes:
+        v = pc[cls]
+        print(f"  {cls:<{col_w}}  {v['precision']:>10.4f}  {v['recall']:>10.4f}  {v['f1']:>10.4f}  {v['support']:>8}")
+
+    print()
+    print(f"  {'Macro avg':<{col_w}}  {results['macro']['precision']:>10.4f}  {results['macro']['recall']:>10.4f}  {results['macro']['f1']:>10.4f}")
+    print(f"  {'Weighted avg':<{col_w}}  {results['weighted']['precision']:>10.4f}  {results['weighted']['recall']:>10.4f}  {results['weighted']['f1']:>10.4f}")
+    print()
+
+
+def run_evaluation(llm_path):
+    # Reset match stats for this run
+    for k in _CS_MATCH_STATS:
+        _CS_MATCH_STATS[k] = 0
+
+    llm = pd.read_csv(llm_path)
+    assert len(mrt) == len(llm), f"Row count mismatch: {llm_path}"
+    n = len(mrt)
+
+    has_cs = "calculator_selected" in llm.columns
+    has_pe = "step1_extracted_params" in llm.columns
+    has_qp = "step2_computed_value" in llm.columns
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    results = []
+    for i in range(n):
+        mrt_row = mrt.iloc[i]
+        llm_row = llm.iloc[i]
+
+        tf            = compute_tf(llm_row)
+        cs, tier      = compute_cs(mrt_row, llm_row) if has_cs else (np.nan, "n/a")
+        pe            = compute_pe(mrt_row, llm_row)  if has_pe else np.nan
+        qp            = compute_qp(mrt_row, llm_row)  if has_qp else np.nan
+
+        results.append({
+            "row_idx":        i,
+            "mrt_row_number": mrt_row["Row Number"],
+            "calculator_gt":  mrt_row["Calculator Name"],
+            "calculator_pred": llm_row["calculator_selected"] if has_cs else np.nan,
+            "TF":   tf,
+            "CS":   cs,   "CS_tier": tier,
+            "PE":   pe,
+            "QP":   qp,
+        })
+
+    results_df = pd.DataFrame(results)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    tf_acc    = results_df["TF"].mean()
+    pe_valid  = results_df["PE"].dropna()
+    qp_series = results_df["QP"].dropna()
+
+    print("=" * 52)
+    print(f"  {llm_path}")
+    print("=" * 52)
+    print(f"  Total rows evaluated : {n}")
+    print()
+    print(f"  TF (Task Fulfillment)")
+    print(f"    Success  : {results_df['TF'].sum():.0f} / {n}")
+    print(f"    Accuracy : {tf_acc:.4f}  ({tf_acc*100:.2f}%)")
+    print()
+    if has_cs:
+        cs_acc = results_df["CS"].mean()
+        print(f"  CS (Calculator Selection)")
+        print(f"    Correct  : {results_df['CS'].sum():.0f} / {n}")
+        print(f"    Accuracy : {cs_acc:.4f}  ({cs_acc*100:.2f}%)")
+        print(f"    Match breakdown:")
+        total_matched = sum(_CS_MATCH_STATS.values())
+        for tier, count in _CS_MATCH_STATS.items():
+            pct = count / total_matched * 100 if total_matched else 0
+            print(f"      {tier:<12} : {count:>5}  ({pct:.1f}%)")
+        print()
+    if has_pe:
+        print(f"  PE (Parameter Extraction)")
+        print(f"    Correct  : {pe_valid.sum():.0f} / {n}")
+        print(f"    Accuracy : {pe_valid.sum()/n:.4f}  ({pe_valid.sum()/n*100:.2f}%)")
+        print()
+    if has_qp:
+        print(f"  QP (Quantitative Precision)")
+        print(f"    Correct  : {qp_series.sum():.0f} / {n}")
+        print(f"    Accuracy : {qp_series.sum()/n:.4f}  ({qp_series.sum()/n*100:.2f}%)")
+    print("=" * 52)
+
+    # ── Classification metrics ─────────────────────────────────────────────────
+
+    true_labels = llm["true_label"].str.strip().str.lower().tolist()
+    pred_labels = llm["predicted_label"].str.strip().str.lower().tolist()
+    clf_results = compute_metrics(true_labels, pred_labels)
+    print_classification_report(llm_path, clf_results)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if args.all:
+    import glob
+    files = sorted(glob.glob("results/**/*.csv", recursive=True))
+    print(f"Found {len(files)} CSV files under results/\n")
+    for f in files:
+        run_evaluation(f)
+else:
+    run_evaluation(args.result_file)
