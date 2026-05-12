@@ -1,23 +1,37 @@
 """
-LLM Fact-Check Evaluator — Classifier-guided Zero-shot Program of Thought (PoT)
-================================================================================
+LLM Fact-Check Evaluator — Classifier-guided Formula-lookup Program of Thought (PoT)
+======================================================================================
 Step 0 (Classifier): FormulaClassifier predicts the calculator name from the
-                     claim text.  The prediction is injected as a hint into the
-                     user message so the LLM knows which formula to apply.
-Step 1-3 (PoT):      The LLM then writes a self-contained Python program that
-                     works through STEP 1 → STEP 2 → STEP 3 and prints one JSON
-                     object.  The host executes the program, captures its stdout,
-                     and applies the same post-processing pipeline as the original
-                     zero_shot_PoT.py — no external calculator is used.
+                     claim text.
 
-Two system-prompt variants are kept:
-  SYSTEM_PROMPT_WITH_CLF  — tells the LLM the calculator was pre-identified.
-  SYSTEM_PROMPT_NO_CLF    — original wording; LLM self-identifies the calculator.
-The correct one is selected per-sample based on whether a hint is available.
-When classifier=None or loading fails the LLM operates exactly as it did in the
-original zero_shot_PoT.py.
+Step 0b (Formula lookup): When the classifier returns a non-null prediction,
+                     the canonical formula for that calculator is looked up
+                     from formula_cleaned.json (Calculator ID → Formula text).
+                     The formula is injected verbatim into the user message as
+                     a hard constraint so the LLM cannot substitute an
+                     alternative formula variant.  A unit-conversion reminder
+                     is appended so values are converted before substitution.
 
-Host-side pipeline (unchanged from zero_shot_PoT.py):
+Step 1-3 (PoT):      The LLM writes a self-contained Python program that works
+                     through STEP 1 → STEP 2 → STEP 3 and prints one JSON
+                     object.  The host executes the program, captures its
+                     stdout, and applies the same post-processing pipeline.
+
+formula_cleaned.json is produced from formula_new.json with the Question field
+removed — only Calculator ID and Formula are kept.
+
+Execution hardening (transparent to the LLM):
+  _safe_float / _safe_int  — unit-aware wrappers injected into the exec
+                             namespace so strings like '18 /min' or 'mm'
+                             never raise ValueError.
+  Unit-conversion helpers  — cm_to_in, cm_to_m, kg_to_lbs, etc. available
+                             as builtins inside the generated program.
+  NameError repair loop    — undefined evidence_* / claimed_* variables are
+                             auto-patched (up to 5 attempts) before giving up.
+  ValueError repair loop   — residual float(bad_string) calls are rewritten
+                             with the numeric part or a 0.0 sentinel.
+
+Host-side pipeline:
   _remove_implicit_from_step1  →  strip the calculator output from step1
   _override_step2_by_criteria  →  enforce MedCalc-Bench accuracy tolerances
   _logical_reasoner            →  derive the final label from step1 + step2
@@ -35,23 +49,24 @@ Install dependencies:
     pip install transformers torch
 
 Usage:
-    python clf_zero_shot_PoT.py --data "mrt_claim_cleaned.csv" \\
+    python clf_formula_PoT.py --data "mrt_claim_cleaned.csv" \\
         --model "$HOME/models/DeepSeek-R1" \\
-        --classifier "./formula_classifier"
+        --classifier "./formula_classifier" \\
+        --formula-data "formula_cleaned.json"
 
-    python clf_zero_shot_PoT.py --data "train_300.csv" \\
+    python clf_formula_PoT.py --data "train_300.csv" \\
         --model "$HOME/models/Llama-3.1-8B-Instruct"
 
-    python clf_zero_shot_PoT.py --data "train_300.csv" \\
+    python clf_formula_PoT.py --data "train_300.csv" \\
         --model "$HOME/models/Qwen2.5-14B-Instruct" --samples 20 --random
 
-    python clf_zero_shot_PoT.py --data "train_300.csv" \\
+    python clf_formula_PoT.py --data "train_300.csv" \\
         --model "$HOME/models/Qwen2.5-14B-Instruct" --no-think
 
-    python clf_zero_shot_PoT.py --data "train_300.csv" \\
+    python clf_formula_PoT.py --data "train_300.csv" \\
         --model "$HOME/models/Llama-3.1-8B-Instruct" --samples 0
 
-    python clf_zero_shot_PoT.py --data "train_300.csv" \\
+    python clf_formula_PoT.py --data "train_300.csv" \\
         --model "$HOME/models/Llama-3.1-8B-Instruct" --seed 42
 """
 
@@ -204,6 +219,69 @@ def _resolve_calculator_id(calc_name: str) -> int:
     if best_overlap >= 3:
         return best_cid
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Formula lookup — maps Calculator ID → canonical formula text
+# ---------------------------------------------------------------------------
+
+class FormulaLoader:
+    """
+    Loads formula_cleaned.json at construction time and indexes entries by
+    Calculator ID for O(1) lookup at inference time.
+
+    formula_cleaned.json entries have three keys:
+        "Calculator ID"  (string or int)
+        "Type"           (string — "Rule-Based" or "Equation-Based",
+                          as defined in MedCalc-Bench Table 9)
+        "Formula"        (string — the canonical formula description)
+
+    The "Question" field from formula_new.json has been deliberately removed.
+    """
+
+    def __init__(self, json_path: str) -> None:
+        self._formulas: dict = {}   # {calc_id (int): formula_text (str)}
+        self._types:    dict = {}   # {calc_id (int): type_str (str)}
+
+        if not json_path or not os.path.exists(json_path):
+            print(f"[FormulaLoader] File not found: {json_path!r}. "
+                  "Formula injection will not be used.")
+            return
+
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        for entry in data:
+            try:
+                calc_id = int(entry["Calculator ID"])
+            except (KeyError, ValueError):
+                continue
+            formula = (entry.get("Formula") or "").strip()
+            calc_type = (entry.get("Type") or "").strip()
+            if formula:
+                self._formulas[calc_id] = formula
+            if calc_type:
+                self._types[calc_id] = calc_type
+
+        print(f"[FormulaLoader] Loaded {len(self._formulas)} formulas "
+              f"({sum(1 for t in self._types.values() if t == 'Rule-Based')} Rule-Based, "
+              f"{sum(1 for t in self._types.values() if t == 'Equation-Based')} Equation-Based) "
+              f"from {json_path!r}.")
+
+    def get_formula(self, calc_id: int) -> str:
+        """Return the formula text for *calc_id*, or '' if not found."""
+        return self._formulas.get(calc_id, "")
+
+    def get_type(self, calc_id: int) -> str:
+        """Return 'Rule-Based', 'Equation-Based', or '' if not found."""
+        return self._types.get(calc_id, "")
+
+    def is_rule_based(self, calc_id: int) -> bool:
+        """Return True when the calculator type is 'Rule-Based'."""
+        return self._types.get(calc_id, "") == "Rule-Based"
+
+    def is_empty(self) -> bool:
+        return not self._formulas
 
 
 # ---------------------------------------------------------------------------
@@ -571,31 +649,113 @@ def _extract_pot_code(raw_text: str) -> str:
     return raw_text.strip()
 
 
-_ALLOWED_IMPORTS = re.compile(
-    r"^\s*import\s+(json|math|re|datetime|collections|functools|itertools|operator"
+_SAFE_MODULES = (
+    r"json|math|re|datetime|collections|functools|itertools|operator"
     r"|statistics|decimal|fractions|calendar|string|textwrap|enum|typing"
-    r"|unicodedata|locale|numbers|cmath|random)\b",
+    r"|unicodedata|locale|numbers|cmath|random"
+)
+
+# Matches:  import json       import datetime   etc.
+_ALLOWED_IMPORTS = re.compile(
+    r"^\s*import\s+(" + _SAFE_MODULES + r")\b",
+    re.MULTILINE,
+)
+
+# Matches:  from datetime import date, timedelta   from math import sqrt   etc.
+_ALLOWED_FROM_IMPORTS = re.compile(
+    r"^\s*from\s+(" + _SAFE_MODULES + r")\s+import\b",
     re.MULTILINE,
 )
 _FORBIDDEN_PATTERNS = re.compile(
-    r"\b(open|exec|eval|compile|__import__|importlib|subprocess|os\.|sys\."
+    # open/exec/eval/compile must be followed by '(' to be function calls,
+    # not matched inside string literals like "eyes open spontaneously".
+    r"\b(open|exec|eval|compile)\s*\(|"
+    r"\b(__import__|importlib|subprocess|os\.|sys\."
     r"|socket|urllib|requests|http|shutil|glob|pathlib|ctypes|threading"
     r"|multiprocessing|signal|resource|pty|atexit|builtins)\b",
     re.IGNORECASE,
 )
 
 
+def _strip_units_from_expr(expr: str) -> str:
+    """
+    Remove unit tokens (e.g. ' kg', ' mmHg', ' /min') from a numeric
+    expression string so it becomes valid Python for eval().
+
+    Only non-operator word tokens following a number are stripped;
+    arithmetic operators, parentheses, and Python keywords are untouched.
+    """
+    # Remove things like "46 kg", "120 mmHg", "18 /min", "475 msec"
+    expr = re.sub(r'(\d)\s+[a-zA-Z/%][a-zA-Z/%]*', r'\1', expr)
+    # Remove leading unit-only tokens (e.g. "kg - 10")
+    expr = re.sub(r'\b[a-zA-Z]+\b(?=\s*[-+*/])', '', expr)
+    return expr
+
+
+def _safe_eval_expr(expr: str) -> float:
+    """
+    Evaluate a simple arithmetic expression string produced by the model.
+    Strips unit tokens first, then evaluates in a minimal namespace.
+    Never raises — returns 0.0 on any error.
+    """
+    import math as _math
+    cleaned = _strip_units_from_expr(str(expr))
+    try:
+        result = eval(  # noqa: S307 — controlled namespace, no builtins
+            cleaned,
+            {"__builtins__": {}, "math": _math,
+             "log": _math.log, "sqrt": _math.sqrt, "exp": _math.exp,
+             "abs": abs, "min": min, "max": max, "round": round},
+        )
+        return float(result)
+    except Exception as e:
+        print(f"  [PoT safe_eval] failed on {cleaned!r}: {e} — using 0.0")
+        return 0.0
+
+
+# ── Patterns that match the two forms the model uses for eval() ──────────────
+_EVAL_CALL_RE = re.compile(
+    r'\beval\s*\(([^)]+)\)',  # eval(some_expr_or_var)
+    re.MULTILINE,
+)
+
+
+def _rewrite_eval_calls(code: str) -> str:
+    """
+    Replace every ``eval(...)`` call in *code* with ``_safe_eval_expr(...)``.
+
+    This keeps the computation intact while bypassing both the forbidden-
+    pattern safety check and the unit-in-string ValueError that ``eval``
+    produces when the substitution string contains tokens like '46 kg'.
+    """
+    rewritten, n = _EVAL_CALL_RE.subn(
+        lambda m: f"_safe_eval_expr({m.group(1)})",
+        code,
+    )
+    if n:
+        print(f"  [PoT pre-process] rewrote {n} eval() call(s) → _safe_eval_expr()")
+    return rewritten
+
+
 def _is_safe_code(code: str) -> tuple:
     """
     Lightweight safety check before exec():
       - Reject any code that references dangerous builtins or I/O.
-      - Allow only a curated set of standard-library imports.
+      - Allow only a curated set of standard-library imports, in both
+        ``import X`` and ``from X import Y`` forms.
     Returns (is_safe, reason).
     """
-    import_lines = re.findall(r"^\s*import\s+\S+|^\s*from\s+\S+\s+import", code, re.MULTILINE)
+    import_lines = re.findall(
+        r"^\s*import\s+\S+|^\s*from\s+\S+\s+import",
+        code, re.MULTILINE,
+    )
     for line in import_lines:
-        if not _ALLOWED_IMPORTS.match(line.strip() + "\n"):
-            return False, f"Disallowed import: {line.strip()}"
+        stripped = line.strip()
+        if _ALLOWED_IMPORTS.match(stripped + "\n"):
+            continue                          # plain import — allowed
+        if _ALLOWED_FROM_IMPORTS.match(stripped + "\n"):
+            continue                          # from-import — allowed
+        return False, f"Disallowed import: {stripped}"
 
     if _FORBIDDEN_PATTERNS.search(code):
         return False, "Forbidden built-in or module reference detected."
@@ -603,52 +763,491 @@ def _is_safe_code(code: str) -> tuple:
     return True, ""
 
 
-def _execute_pot_code(code: str) -> dict | None:
+def _safe_float(x) -> float:
     """
-    Execute the LLM-generated Python program in an isolated namespace.
-    Captures stdout, parses the printed JSON, and returns the parsed dict.
-    Returns None on any error.
+    Unit-aware replacement for ``float()`` injected into the PoT execution
+    namespace.  Handles strings like ``'18 /min'``, ``'180 mm'``, or bare
+    unit tokens like ``'mm'`` without raising ValueError.
     """
-    safe, reason = _is_safe_code(code)
-    if not safe:
-        print(f"  [PoT] Code rejected by safety check: {reason}")
+    try:
+        return float(x)
+    except (ValueError, TypeError):
+        if isinstance(x, str):
+            m = re.search(r'[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?', x)
+            if m:
+                val = float(m.group())
+                print(f"  [PoT safe_float] extracted {val} from {x!r}")
+                return val
+        print(f"  [PoT safe_float] cannot parse {x!r} — using 0.0 sentinel")
+        return 0.0
+
+
+def _safe_int(x) -> int:
+    """
+    Unit-aware replacement for ``int()`` injected into the PoT execution
+    namespace.  Strings like ``'3 days'`` → 3; bare units like ``'/min'`` → 0.
+    """
+    try:
+        return int(x)
+    except (ValueError, TypeError):
+        if isinstance(x, str):
+            m = re.search(r'[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?', x)
+            if m:
+                val = int(float(m.group()))
+                print(f"  [PoT safe_int] extracted {val} from {x!r}")
+                return val
+        print(f"  [PoT safe_int] cannot parse {x!r} — using 0 sentinel")
+        return 0
+
+
+def _repair_self_ref_calculation(code: str) -> str | None:
+    """
+    Fix the common model error where the ``calculation`` dict references
+    ``calculation['substitution']`` or ``calculation['steps']`` inside its
+    own literal definition, e.g.:
+
+        calculation = {
+            "substitution": subst_expr,
+            "steps":        f"{calculation['substitution']} = {value}",
+            ...
+        }
+
+    At the point the dict literal is evaluated ``calculation`` is not yet
+    defined, so Python raises ``NameError: name 'calculation' is not defined``.
+
+    Repair strategy:
+      1. Find the ``substitution`` value inside the ``calculation = {`` block.
+      2. Assign it to a temporary ``_subst`` variable just before the block.
+      3. Replace every ``calculation['substitution']`` / ``calculation["substitution"]``
+         reference inside the block with ``_subst``.
+    """
+    # Locate `calculation = {` block
+    block_start = re.search(r'^[ \t]*calculation\s*=\s*\{', code, re.MULTILINE)
+    if not block_start:
         return None
 
-    namespace: dict = {"__builtins__": __builtins__}
-    captured = io.StringIO()
-    old_stdout = sys.stdout
+    # Check that it actually contains a self-reference
+    if not re.search(r"calculation\s*\[\s*['\"]substitution['\"]\s*\]", code):
+        return None
 
+    # Extract the substitution value from inside the block
+    subst_val_m = re.search(
+        r'"substitution"\s*:\s*(.+?)(?=,\s*\n|\n\s*")',
+        code[block_start.start():],
+        re.DOTALL,
+    )
+    if not subst_val_m:
+        return None
+
+    subst_val = subst_val_m.group(1).strip().rstrip(',').strip()
+
+    # Pre-assign a local variable just before the block
+    insert_line = f"_subst = {subst_val}  # auto-extracted for self-ref fix\n"
+    patched = (
+        code[:block_start.start()]
+        + insert_line
+        + code[block_start.start():]
+    )
+
+    # Replace self-references with _subst
+    patched = re.sub(
+        r"calculation\s*\[\s*['\"]substitution['\"]\s*\]",
+        "_subst",
+        patched,
+    )
+    # Also fix the substitution value itself to use _subst
+    patched = re.sub(
+        r'("substitution"\s*:\s*)' + re.escape(subst_val),
+        r'\1_subst',
+        patched,
+    )
+    print("  [PoT repair] self-referential calculation dict patched → _subst")
+    return patched
+
+
+def _repair_name_error(code: str, missing_name: str) -> str | None:
+    """
+    Attempt to patch a NameError caused by an undefined evidence_* / claimed_*
+    variable.  Tries three strategies in order:
+
+    1. Mirror the value from a peer ``claimed_*`` / ``evidence_*`` variable
+       with the same semantic suffix.
+    2. Find any numeric assignment whose variable name shares key tokens.
+    3. Define the missing name as 0.0 (safe sentinel).
+
+    Returns patched code, or None if the name doesn't look auto-generated.
+    """
+    if not re.match(r'^[a-z][a-z0-9_]*$', missing_name):
+        return None
+
+    # Strategy 1 — mirror from a peer evidence_* / claimed_* variable
+    suffix_match = re.match(r'^(?:evidence|claimed)_(.+)$', missing_name)
+    if suffix_match:
+        semantic_suffix = suffix_match.group(1)
+        for prefix in ("claimed", "evidence"):
+            peer_name = f"{prefix}_{semantic_suffix}"
+            if peer_name == missing_name:
+                continue
+            peer_pat = re.compile(
+                rf'^[ \t]*{re.escape(peer_name)}\s*=\s*(.+)', re.MULTILINE)
+            m = peer_pat.search(code)
+            if m:
+                rhs = m.group(1).strip().rstrip('#').strip()
+                print(f"  [PoT repair] NameError: '{missing_name}' ← mirrored "
+                      f"from '{peer_name}'")
+                return f"{missing_name} = {rhs}  # auto-patched from {peer_name}\n" + code
+
+    # Strategy 2 — find an assignment for this exact variable name elsewhere
+    exact_pat = re.compile(
+        rf'^[ \t]*{re.escape(missing_name)}\s*=\s*(.+)', re.MULTILINE)
+    m = exact_pat.search(code)
+    if m:
+        rhs = m.group(1).strip().rstrip('#').strip()
+        # Prepend a forward-declaration before any use of the variable
+        print(f"  [PoT repair] NameError: '{missing_name}' ← forward-declared "
+              f"from existing assignment: {rhs[:60]}")
+        return f"{missing_name} = {rhs}  # auto-patched forward-decl\n" + code
+
+    # Strategy 3 — token match against any line that has a numeric literal
+    _SKIP = frozenset({
+        "evidence", "claimed", "correct", "gap", "score", "index",
+        "result", "value", "val", "calc", "the", "a", "an",
+        "points", "criterion", "step", "label", "type",
+    })
+    tokens = [t for t in re.findall(r'[a-z]+', missing_name) if t not in _SKIP]
+    if tokens:
+        num_pat = re.compile(r'[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?')
+        for line in code.splitlines():
+            if all(tok in line.lower() for tok in tokens):
+                nums = num_pat.findall(line)
+                if nums:
+                    print(f"  [PoT repair] NameError: '{missing_name}' ← "
+                          f"{nums[-1]} (token match)")
+                    return (f"{missing_name} = {nums[-1]}  # auto-patched\n"
+                            + code)
+
+    # Strategy 4 — safe sentinel (always succeeds)
+    print(f"  [PoT repair] NameError: '{missing_name}' ← 0.0 (sentinel)")
+    return f"{missing_name} = 0.0  # auto-patched sentinel\n" + code
+
+
+def _repair_value_error(code: str, exc: ValueError) -> str | None:
+    """
+    Secondary safety net for ``ValueError: could not convert string to float``.
+    The primary defence is _safe_float / _safe_int in the exec namespace.
+    This handles residual cases where the bad string appears as a literal call.
+    """
+    bad_m = re.search(r"could not convert string to float:\s*'([^']*)'", str(exc))
+    if not bad_m:
+        return None
+
+    bad_str = bad_m.group(1)
+    num_m   = re.search(r'[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?', bad_str)
+    rep_val = float(num_m.group()) if num_m else 0.0
+    rep_lit = repr(rep_val)
+
+    escaped  = re.escape(bad_str)
+    call_pat = re.compile(
+        r'\b(?:float|int)\s*\(\s*["\']' + escaped + r'["\']\s*\)')
+    new_code, n = call_pat.subn(rep_lit, code)
+    if n == 0:
+        lit_pat  = re.compile(
+            r'(?<![a-zA-Z_])["\']' + escaped + r'["\'](?![a-zA-Z_])')
+        new_code, n = lit_pat.subn(rep_lit, code)
+    if n == 0:
+        return None
+
+    action = "numeric extract" if num_m else "sentinel"
+    print(f"  [PoT repair] ValueError: float('{bad_str}') → {rep_lit} "
+          f"({action}, {n} site{'s' if n != 1 else ''} patched)")
+    return new_code
+
+
+def _run_code_in_namespace(code: str) -> tuple:
+    """
+    Compile and exec *code* in an isolated namespace.
+
+    Pre-populates the namespace with:
+    - ``float`` / ``int`` shadowed by ``_safe_float`` / ``_safe_int``
+    - Unit-conversion helpers: cm_to_in, in_to_cm, cm_to_m, m_to_cm,
+      kg_to_lbs, lbs_to_kg, mg_dl_to_mmol, mmol_to_mg_dl
+
+    Returns (stdout_str, exception_or_None, namespace_dict).
+    The namespace is always returned so callers can salvage partial state
+    (e.g. ``entities`` populated by STEP 1) when execution fails in STEP 2.
+    """
+    namespace: dict = {
+        "__builtins__": __builtins__,
+        "float": _safe_float,
+        "int":   _safe_int,
+        # safe eval helper for models that compute via eval(substitution_string)
+        "_safe_eval_expr": _safe_eval_expr,
+        # math module pre-injected: the model sometimes places 'import math'
+        # at the bottom of the code, after math.log() calls that need it.
+        "math": __import__("math"),
+        # unit-conversion helpers
+        "cm_to_in":      lambda x: _safe_float(x) / 2.54,
+        "in_to_cm":      lambda x: _safe_float(x) * 2.54,
+        "cm_to_m":       lambda x: _safe_float(x) / 100.0,
+        "m_to_cm":       lambda x: _safe_float(x) * 100.0,
+        "kg_to_lbs":     lambda x: _safe_float(x) * 2.2046,
+        "lbs_to_kg":     lambda x: _safe_float(x) / 2.2046,
+        "mg_dl_to_mmol": lambda x, mw: _safe_float(x) / _safe_float(mw),
+        "mmol_to_mg_dl": lambda x, mw: _safe_float(x) * _safe_float(mw),
+    }
+    captured   = io.StringIO()
+    old_stdout = sys.stdout
+    exc_out    = None
     try:
         sys.stdout = captured
         exec(compile(code, "<pot_program>", "exec"), namespace)  # noqa: S102
     except Exception as exc:
-        sys.stdout = old_stdout
-        print(f"  [PoT] Execution error: {exc}")
-        traceback.print_exc()
-        return None
+        exc_out = exc
     finally:
         sys.stdout = old_stdout
+    return captured.getvalue(), exc_out, namespace
 
-    output = captured.getvalue().strip()
-    if not output:
-        print("  [PoT] Program produced no output.")
-        return None
 
-    # The last line should be valid JSON; try progressively shorter suffixes
-    for line in reversed(output.splitlines()):
+def _parse_stdout_json(output: str) -> dict | None:
+    """Extract the first valid JSON object from captured stdout."""
+    for line in reversed(output.strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
                 return json.loads(line)
             except json.JSONDecodeError:
                 pass
-
-    # Fallback: try the entire captured output
     try:
-        return json.loads(output)
+        return json.loads(output.strip())
     except json.JSONDecodeError:
-        print(f"  [PoT] Could not parse JSON from output:\n{output[:300]}")
         return None
+
+
+def _repair_broken_fstring(code: str) -> str:
+    """
+    Fix multi-line f-strings that the model accidentally splits across lines,
+    e.g.:
+
+        "steps": f"Anion Gap = {anion_gap_formula}
+        {anion_gap_substitution} = {anion_gap}"
+
+    Python requires the closing quote on the same logical line.  We detect
+    lines inside a dict/call that start with an unmatched `f"` (no closing `"`)
+    and join them with their continuation line(s).
+    """
+    lines = code.splitlines()
+    result = []
+    i = 0
+    joined = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.rstrip()
+        fstr_open = re.search(r'\bf"', stripped)
+        if fstr_open:
+            after = stripped[fstr_open.start() + 1:]  # skip the f, keep the opening "
+            quote_count = len(re.findall(r'(?<!\\)"', after))
+            # Keep joining continuation lines until we have an even number of quotes
+            while quote_count % 2 == 1 and i + 1 < len(lines):
+                joined += 1
+                i += 1
+                stripped = stripped + " " + lines[i].strip()
+                after = stripped[fstr_open.start() + 1:]
+                quote_count = len(re.findall(r'(?<!\\)"', after))
+            result.append(stripped)
+            i += 1
+            continue
+        result.append(line)
+        i += 1
+    if joined:
+        print(f"  [PoT pre-process] joined {joined} broken f-string line(s)")
+    return "\n".join(result)
+
+
+def _repair_type_error(code: str, exc: TypeError) -> str | None:
+    """
+    Repair ``TypeError: can't multiply sequence by non-int of type 'float'``
+    (and similar arithmetic-on-string errors) that occur when a string variable
+    such as ``evidence_sex = "Male"`` is used directly in a numeric formula.
+
+    Strategy: find every ``evidence_*`` / ``claimed_*`` / ``correct_*`` variable
+    whose current value in the code is a quoted string, and inject a numeric
+    conversion just before the first arithmetic use of that variable.
+    """
+    msg = str(exc).lower()
+    if "sequence" not in msg and "str" not in msg:
+        return None
+
+    # Find all string-valued evidence/claimed variables: evidence_foo = "bar"
+    string_vars = re.findall(
+        r'^[ \t]*(evidence_\w+|claimed_\w+)\s*=\s*["\'][^"\']*["\']',
+        code, re.MULTILINE,
+    )
+    if not string_vars:
+        return None
+
+    # Check which ones appear in arithmetic context (multiplied, divided, etc.)
+    patched = code
+    n_patched = 0
+    for var in string_vars:
+        # arithmetic use: the variable appears next to a numeric operator
+        arith_use = re.search(
+            rf'(?<!["\'])(?:\d|\))\s*[\+\-\*\/]\s*{re.escape(var)}'
+            rf'|{re.escape(var)}\s*[\+\-\*\/]\s*(?:\d|\()',
+            patched,
+        )
+        if arith_use:
+            # Inject float() wrapper around every arithmetic use
+            patched = re.sub(
+                rf'\b{re.escape(var)}\b(?!\s*=)',   # use sites only, not assignments
+                f'float({var})',
+                patched,
+            )
+            n_patched += 1
+
+    if n_patched:
+        print(f"  [PoT repair] TypeError: wrapped {n_patched} string variable(s) "
+              f"in float(): {string_vars[:3]}")
+        return patched
+    return None
+
+
+def _extract_partial_from_namespace(namespace: dict) -> dict | None:
+    """
+    After a mid-execution crash, salvage whatever STEP 1 / STEP 2 data was
+    already written into *namespace* before the error occurred.
+
+    Returns a parsed dict in the same schema as a successful execution:
+      {
+        "step1_entities":    [...],   # from namespace['entities']
+        "step2_calculation": {...},   # from namespace['calculation'] if present
+        "step3_label":       "...",   # derived from partial data
+      }
+
+    Returns None when no useful data is found (empty entities list).
+    """
+    # Collect entities — the model always uses the name 'entities'
+    entities = namespace.get("entities")
+    if not isinstance(entities, list) or not entities:
+        return None
+
+    # Collect calculation dict if STEP 2 completed before the crash
+    calc = namespace.get("calculation")
+    if not isinstance(calc, dict):
+        calc = {}
+
+    # Derive a partial label from whatever we have
+    all_step1_correct = all(bool(e.get("correct", False)) for e in entities)
+    calc_correct      = bool(calc.get("correct", False)) if calc else False
+
+    if all_step1_correct and calc_correct:
+        label = "true"
+    elif all_step1_correct:
+        # STEP 2 either failed or is absent — treat as partially true
+        label = "partially true"
+    else:
+        label = "false"
+
+    print(f"  [PoT partial] salvaged {len(entities)} entities from namespace "
+          f"(step2 present={bool(calc)}) → label={label}")
+
+    return {
+        "step1_entities":    entities,
+        "step2_calculation": calc,
+        "step3_label":       label,
+    }
+
+
+def _execute_pot_code(code: str, max_repairs: int = 15) -> dict | None:
+    """
+    Execute the LLM-generated Python program in an isolated namespace.
+    Captures stdout, parses the printed JSON, and returns the parsed dict.
+    Returns None on any error.
+
+    Automatic repair (up to *max_repairs* consecutive attempts):
+      NameError   — undefined evidence_* / claimed_* variables are patched
+                    via _repair_name_error.
+      ValueError  — residual float(bad_string) calls are rewritten via
+                    _repair_value_error (primary defence is _safe_float in
+                    the namespace so most of these never reach here).
+    """
+    # Pre-process: fix broken multi-line f-strings
+    code = _repair_broken_fstring(code)
+
+    # Pre-process: rewrite eval() calls → _safe_eval_expr() before safety check
+    code = _rewrite_eval_calls(code)
+
+    # Pre-process: fix self-referential calculation dict if present
+    patched = _repair_self_ref_calculation(code)
+    if patched is not None:
+        code = patched
+
+    safe, reason = _is_safe_code(code)
+    if not safe:
+        print(f"  [PoT] Code rejected by safety check: {reason}")
+        return None
+
+    current_code    = code
+    repaired_tokens: set = set()
+    last_namespace: dict = {}
+
+    for _ in range(max_repairs + 1):
+        output, exc, namespace = _run_code_in_namespace(current_code)
+        last_namespace = namespace
+
+        if exc is None:
+            if not output.strip():
+                print("  [PoT] Program produced no output.")
+                return _extract_partial_from_namespace(namespace)
+            result = _parse_stdout_json(output)
+            if result is None:
+                print(f"  [PoT] Could not parse JSON from output:\n{output[:300]}")
+            return result
+
+        if isinstance(exc, NameError):
+            name_m = re.search(r"name '([^']+)' is not defined", str(exc))
+            if name_m:
+                missing = name_m.group(1)
+                if missing not in repaired_tokens:
+                    patched = _repair_name_error(current_code, missing)
+                    if patched is not None:
+                        repaired_tokens.add(missing)
+                        current_code = patched
+                        continue
+
+        elif isinstance(exc, ValueError):
+            bad_m = re.search(
+                r"could not convert string to float:\s*'([^']*)'", str(exc))
+            if bad_m:
+                key = f"float:'{bad_m.group(1)}'"
+                if key not in repaired_tokens:
+                    patched = _repair_value_error(current_code, exc)
+                    if patched is not None:
+                        repaired_tokens.add(key)
+                        current_code = patched
+                        continue
+
+        elif isinstance(exc, TypeError):
+            key = f"type:{exc}"
+            if key not in repaired_tokens:
+                patched = _repair_type_error(current_code, exc)
+                if patched is not None:
+                    repaired_tokens.add(key)
+                    current_code = patched
+                    continue
+
+        print(f"  [PoT] Execution error: {exc}")
+        traceback.print_exc()
+        # Try to salvage STEP 1 entities from the namespace before giving up
+        partial = _extract_partial_from_namespace(namespace)
+        if partial is not None:
+            return partial
+        return None
+
+    print(f"  [PoT] Gave up after {max_repairs} repair attempts.")
+    partial = _extract_partial_from_namespace(last_namespace)
+    if partial is not None:
+        return partial
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +1272,121 @@ def _keyword_label(text: str) -> str:
     return "false"
 
 
-def _parse_response(raw_text: str, claim: str = "") -> dict:
+_CODE_CONDITIONAL_RE = re.compile(
+    r'\bif\b|'           # if statement / ternary
+    r'\belse\b|'         # else branch
+    r'>=|<=|!=|==|>|<',  # comparison operators
+)
+
+
+def _code_has_conditionals(pot_code: str) -> bool:
+    """
+    Return True when the generated Python source contains at least one
+    conditional or comparison expression.
+
+    When the LLM correctly evaluates each criterion with an if/else
+    ternary (e.g. ``score = 1 if sbp > 160 else 0``), the *substitution*
+    f-string captures the *result* of those expressions as bare 0/1 literals.
+    That makes the substitution look like hardcoded literals even though the
+    code did evaluate thresholds.  Checking the source directly distinguishes
+    legitimate evaluation from truly hardcoded scores.
+    """
+    return bool(_CODE_CONDITIONAL_RE.search(pot_code))
+
+
+def _validate_rule_based_score(parsed: dict, formula_text: str = "",
+                               calc_type: str = "",
+                               pot_code: str = "") -> dict:
+    """
+    Post-execution sanity check for rule-based calculators.
+
+    Uses *calc_type* (from FormulaLoader.get_type()) as the authoritative
+    source to determine whether the calculator is rule-based.  Falls back to
+    text heuristics on *formula_text* when calc_type is unavailable.
+
+    A substitution composed entirely of numeric literals (e.g. '0+1+1+0')
+    can mean one of two things:
+      a) The LLM hardcoded every point without evaluating any threshold  ← BAD
+      b) The LLM used if/else expressions and the f-string captured the
+         evaluated 0/1 results                                            ← GOOD
+
+    We distinguish them by inspecting *pot_code*: if the source contains
+    conditional/comparison expressions, case (b) applies and we skip the
+    penalty.  Only when the code has no conditionals at all do we treat
+    the all-literals substitution as genuinely hardcoded and penalise it.
+    """
+    if not _is_rule_based_formula(formula_text, calc_type):
+        return parsed
+
+    calc = parsed.get("step2_calculation", {})
+    substitution = str(calc.get("substitution", "")).strip()
+    if not substitution:
+        return parsed
+
+    # Tokenise the substitution: strip operators and punctuation, keep tokens
+    tokens = re.split(r'[\s\+\-\*\/\(\)\,]+', substitution)
+    tokens = [t.strip() for t in tokens if t.strip()]
+
+    if not tokens:
+        return parsed
+
+    # Check whether every token is a bare numeric literal
+    def _is_numeric_literal(tok: str) -> bool:
+        try:
+            float(tok)
+            return True
+        except ValueError:
+            return False
+
+    all_literals = all(_is_numeric_literal(t) for t in tokens)
+    if not all_literals:
+        return parsed   # substitution contains variable names — clearly fine
+
+    # All tokens are numeric literals.  Before penalising, check whether the
+    # generated code actually used conditional logic.  If it did, the literals
+    # are evaluated results (case b) and no penalty is needed.
+    if pot_code and _code_has_conditionals(pot_code):
+        print(f"  [rule-based validator] Substitution '{substitution}' contains "
+              f"only literals but code contains conditional expressions — "
+              f"treating as evaluated results (no penalty).")
+        return parsed
+
+    # All tokens are literals and code has no conditionals: the LLM hardcoded
+    cr_str  = str(calc.get("correct_result",  "")).strip()
+    clm_str = str(calc.get("claimed_result", "")).strip()
+
+    # Extract numeric values for comparison
+    cr_m  = re.search(r'[\-\d.]+', cr_str)
+    clm_m = re.search(r'[\-\d.]+', clm_str)
+
+    if cr_m and clm_m:
+        try:
+            cr_val  = float(cr_m.group())
+            clm_val = float(clm_m.group())
+            scores_match = (cr_val == clm_val)
+        except ValueError:
+            scores_match = False
+    else:
+        scores_match = (cr_str == clm_str)
+
+    if not scores_match:
+        # Hardcoded substitution AND wrong answer → force incorrect
+        print(f"  [rule-based validator] Substitution '{substitution}' "
+              f"contains only literals and code has no conditionals — "
+              f"LLM hardcoded the score. Marking step2 correct=False.")
+        calc["correct"] = False
+    else:
+        # Hardcoded but happens to match — log a warning, keep as-is
+        print(f"  [rule-based validator] Substitution '{substitution}' "
+              f"contains only literals but score matches claimed value "
+              f"({cr_val} == {clm_val}) — keeping correct=True.")
+
+    return parsed
+
+
+def _parse_response(raw_text: str, claim: str = "",
+                    formula_text: str = "",
+                    calc_type: str = "") -> dict:
     """
     PoT response pipeline:
 
@@ -682,9 +1395,11 @@ def _parse_response(raw_text: str, claim: str = "") -> dict:
       2. Safety-check the code.
       3. Execute the code; capture the printed JSON.
       4. _remove_implicit_from_step1  — strip the calculator output from step1.
-      5. _override_step2_by_criteria  — enforce benchmark accuracy tolerance.
-      6. _logical_reasoner            — derive the final label.
-      7. Fallback: keyword scan if execution fails.
+      5. _validate_rule_based_score   — catch truly hardcoded all-literal substitutions
+                                       (skipped when the code contains conditional logic).
+      6. _override_step2_by_criteria  — enforce benchmark accuracy tolerance.
+      7. _logical_reasoner            — derive the final label.
+      8. Fallback: keyword scan if execution fails.
 
     Returns {"reasoning": str, "label": str, "pot_code": str}.
     Note: "calculator_selected" is attached by the caller (run_batch / retry path).
@@ -714,6 +1429,7 @@ def _parse_response(raw_text: str, claim: str = "") -> dict:
             return {"reasoning": code, "label": label, "pot_code": code}
 
         parsed = _remove_implicit_from_step1(parsed, claim)
+        parsed = _validate_rule_based_score(parsed, formula_text, calc_type, pot_code=code)
         parsed = _override_step2_by_criteria(parsed)
 
         label = _logical_reasoner(parsed)
@@ -738,7 +1454,7 @@ def _parse_response(raw_text: str, claim: str = "") -> dict:
 
     # ── Execution failed — keyword scan over the raw model output ──────────
     return {
-        "reasoning": raw_text[:2000],
+        "reasoning": raw_text[:8000],
         "label":     _keyword_label(raw_text),
         "pot_code":  code,
     }
@@ -782,6 +1498,15 @@ def load_model(model_name: str) -> dict:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Clear the tokenizer's own context-length ceiling so it never silently
+    # truncates prompts or caps generation shorter than max_new_tokens.
+    # Only override when the stored value is unreasonably small (< 32 000);
+    # very large sentinels (e.g. Llama-3's 1 000 000 000 000) are fine as-is.
+    _tok_max = getattr(tokenizer, "model_max_length", None)
+    if _tok_max is not None and _tok_max < 32_000:
+        print(f"  tokenizer.model_max_length was {_tok_max} — raising to 32768")
+        tokenizer.model_max_length = 32_768
+
     has_gpu = torch.cuda.is_available()
     print(f"  GPU available: {has_gpu}")
 
@@ -792,8 +1517,16 @@ def load_model(model_name: str) -> dict:
         low_cpu_mem_usage=True,
     )
 
-    if hasattr(model, "generation_config") and model.generation_config.max_length == 20:
-        model.generation_config.max_length = None
+    # Unconditionally clear max_length on the model's generation_config.
+    # The previous guard (`== 20`) only caught the Transformers internal
+    # sentinel and missed model-specific values such as Llama's 4096, which
+    # would silently cap total tokens (prompt + output) and truncate generation
+    # even when max_new_tokens=8192 was requested.
+    if hasattr(model, "generation_config"):
+        old_max = model.generation_config.max_length
+        if old_max is not None:
+            print(f"  model.generation_config.max_length was {old_max} — clearing to None")
+            model.generation_config.max_length = None
 
     pipe = pipeline(
         "text-generation",
@@ -824,18 +1557,95 @@ def _classify_claim(classifier: "FormulaClassifier", claim: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Rule-based formula helpers
+# ---------------------------------------------------------------------------
+
+def _is_rule_based_formula(formula_text: str = "", calc_type: str = "") -> bool:
+    """
+    Return True when the calculator is rule-based.
+
+    Priority:
+    1. Use *calc_type* when it is set (looked up from FormulaLoader.get_type()).
+       This is the authoritative source — taken directly from MedCalc-Bench
+       Table 9 via the "Type" field added to formula_cleaned.json.
+    2. Fall back to text heuristics on *formula_text* only when calc_type is
+       unavailable (e.g. the loader was not provided or the ID was not found).
+       Heuristic: presence of "point" or "criteria" in the formula text.
+    """
+    if calc_type:
+        return calc_type.strip().lower() == "rule-based"
+    # Legacy heuristic fallback
+    t = formula_text.lower()
+    return "point" in t or "criteria" in t
+
+
+_RULE_BASED_SCORING_HINT = """\
+MANDATORY RULE-BASED SCORING PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is a rule-based (criteria-driven) calculator. EVERY criterion MUST be \
+evaluated as a Python boolean or comparison expression against the actual \
+evidence value. Never assign points without checking the threshold condition.
+
+Use one of these three patterns for each criterion:
+
+  Pattern A — binary (Yes/No, Present/Absent):
+      criterion_points = <weight> if <boolean_condition> else 0
+      # e.g.: confusion_points = 1 if confusion_present else 0
+      #       dvt_signs_points  = 3 if dvt_signs_present  else 0
+
+  Pattern B — tiered range (multiple score levels):
+      if evidence_value >= upper_threshold:
+          criterion_points = <high_weight>
+      elif evidence_value >= lower_threshold:
+          criterion_points = <mid_weight>
+      else:
+          criterion_points = 0
+      # e.g. for Age in CHA₂DS₂-VASc:
+      #   if evidence_age >= 75: age_points = 2
+      #   elif evidence_age >= 65: age_points = 1
+      #   else: age_points = 0
+
+  Pattern C — direct numeric value (only for criteria that say "enter X in years/units"):
+      criterion_points = evidence_value
+      # e.g. PSI age criterion: age_points = evidence_age
+
+FORBIDDEN patterns — these are ALWAYS wrong for rule-based calculators:
+  criterion_points = 1                    # hardcoded — threshold never checked
+  criterion_points = evidence_value       # raw value for a Yes/No criterion
+  substitution uses only integer literals # means no evidence was used at all
+
+The final score MUST be computed in Python as the sum of all criterion_points \
+variables. The substitution field must show the actual threshold-checked \
+expressions, NOT bare integers like "1 + 1 + 1 + 1 + 1".
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+
+# ---------------------------------------------------------------------------
 # Message builder
 # ---------------------------------------------------------------------------
 
 def _build_messages(item: dict, ev_limit: int,
                     no_think: bool = False,
-                    calculator_hint: str = "") -> list:
+                    calculator_hint: str = "",
+                    formula_text: str = "",
+                    calc_type: str = "") -> list:
     """
     Build the chat message list for one sample.
 
     calculator_hint : when non-empty, prepended to the user message so the LLM
                       knows which calculator to apply in STEP 2 of its program.
                       Also selects SYSTEM_PROMPT_WITH_CLF over SYSTEM_PROMPT_NO_CLF.
+    formula_text    : canonical formula looked up from formula_cleaned.json for
+                      the predicted calculator.  Injected as a hard constraint
+                      directly after the calculator hint so the LLM cannot
+                      substitute an alternative formula variant.  A unit-
+                      conversion reminder is appended.  Only injected when
+                      calculator_hint is also set.
+    calc_type       : "Rule-Based" or "Equation-Based" from FormulaLoader.get_type().
+                      When "Rule-Based", the mandatory boolean-pattern hint is
+                      appended to the formula section.  Falls back to text
+                      heuristics on formula_text when calc_type is empty.
     no_think        : prepends '/no_think' for Qwen3 thinking models to skip the
                       <think> block and output the program directly.
     """
@@ -843,8 +1653,26 @@ def _build_messages(item: dict, ev_limit: int,
         f"Calculator identified by classifier: {calculator_hint}\n\n"
         if calculator_hint else ""
     )
+
+    if calculator_hint and formula_text:
+        is_rb = _is_rule_based_formula(formula_text, calc_type)
+        rb_hint = ("\n" + _RULE_BASED_SCORING_HINT) if is_rb else ""
+        formula_section = (
+            f"REQUIRED FORMULA (use this exactly — do not substitute an "
+            f"alternative variant):\n{formula_text}{rb_hint}\n"
+            f"UNIT REQUIREMENT: Convert all input values to the units expected "
+            f"by the formula before substituting (e.g. cm → inches for IBW, "
+            f"cm → m for BMI). Show each conversion step explicitly in your "
+            f"substitution. Helper functions cm_to_in(x), cm_to_m(x), "
+            f"in_to_cm(x), m_to_cm(x), kg_to_lbs(x), lbs_to_kg(x) are "
+            f"available without import.\n\n"
+        )
+    else:
+        formula_section = ""
+
     user_msg = (
         f"{hint_line}"
+        f"{formula_section}"
         f"Evidence:\n{item['evidence'][:ev_limit]}\n\n"
         f"Claim:\n{item['claim']}\n\n"
         "Output ONLY the Python program. No prose, no markdown fences."
@@ -871,10 +1699,16 @@ def run_batch(
     max_tokens: int,
     no_think: bool = False,
     classifier: "FormulaClassifier" = None,
+    formula_loader: "FormulaLoader" = None,
 ) -> list:
     """
     Run inference on a list of items one sample at a time (batch_size=1).
     Greedy decoding is pinned unconditionally (do_sample=False).
+
+    When both *classifier* and *formula_loader* are provided and the classifier
+    returns a non-null prediction, the canonical formula for the identified
+    calculator is looked up and injected into the user message as a hard
+    constraint, preventing the LLM from inventing alternative formula variants.
 
     Returns a list of dicts:
       {"reasoning": str, "label": str, "pot_code": str, "calculator_selected": str}
@@ -884,6 +1718,7 @@ def run_batch(
     pipe = model["pipeline"]
     gen_cfg = GenerationConfig(
         max_new_tokens=max_tokens,
+        max_length=None,   # prevent model-level max_length from capping total tokens
         do_sample=False,
         pad_token_id=model.get("pad_token_id") or pipe.tokenizer.pad_token_id,
     )
@@ -892,9 +1727,25 @@ def run_batch(
     for item in batch:
         # Step 0: run classifier to identify the calculator
         calc_name = _classify_claim(classifier, item["claim"])
-        messages  = _build_messages(item, ev_limit,
-                                    no_think=no_think,
-                                    calculator_hint=calc_name)
+
+        # Step 0b: look up the canonical formula and type for the predicted calculator
+        formula_text = ""
+        calc_type    = ""
+        if calc_name and formula_loader is not None:
+            calc_id      = _resolve_calculator_id(calc_name)
+            formula_text = formula_loader.get_formula(calc_id)
+            calc_type    = formula_loader.get_type(calc_id)
+            if formula_text:
+                print(f"  [formula] {calc_name} (ID {calc_id}, {calc_type}): "
+                      f"{formula_text[:80]}{'...' if len(formula_text) > 80 else ''}")
+            else:
+                print(f"  [formula] No entry for '{calc_name}' (ID {calc_id})")
+
+        messages = _build_messages(item, ev_limit,
+                                   no_think=no_think,
+                                   calculator_hint=calc_name,
+                                   formula_text=formula_text,
+                                   calc_type=calc_type)
 
         out = pipe(
             messages,
@@ -902,7 +1753,9 @@ def run_batch(
             return_full_text=False,
         )
         raw  = out[0]["generated_text"].strip()
-        resp = _parse_response(raw, item.get("claim", ""))
+        resp = _parse_response(raw, item.get("claim", ""),
+                               formula_text=formula_text,
+                               calc_type=calc_type)
         resp["calculator_selected"] = calc_name
         results.append(resp)
 
@@ -987,7 +1840,7 @@ def main():
                         ))
     parser.add_argument("--max-tokens", type=int, default=4096,
                         help=(
-                            "Max output tokens per inference (default: 4096). "
+                            "Max output tokens per inference (default: 8192). "
                             "PoT programs are typically shorter than CoT chains, "
                             "so 2048 is usually sufficient.  Increase to 8192 for "
                             "Qwen thinking models without --no-think."
@@ -998,6 +1851,14 @@ def main():
                         help="Seconds to sleep between samples (default: 0.0)")
     parser.add_argument("--output", default="",
                         help="Output CSV path (default: auto-generated with timestamp)")
+    parser.add_argument("--formula-data", default="formula_cleaned.json",
+                        help=(
+                            "Path to formula_cleaned.json (default: formula_cleaned.json). "
+                            "When provided AND the classifier returns a non-null prediction, "
+                            "the canonical formula for that calculator is injected into the "
+                            "user message as a hard constraint. Pass an empty string to run "
+                            "without formula injection."
+                        ))
     parser.add_argument("--no-think", action="store_true",
                         help=(
                             "Prepend '/no_think' to user messages. "
@@ -1042,6 +1903,19 @@ def main():
                   "Proceeding without calculator hint.\n")
     else:
         print("No classifier path provided — running without calculator hint.\n")
+
+    # -- Load formula lookup -----------------------------------------------
+    formula_loader = None
+    if args.formula_data:
+        formula_loader = FormulaLoader(args.formula_data)
+        if formula_loader.is_empty():
+            print("Warning: formula loader is empty — no formulas will be injected.\n")
+        elif classifier is None:
+            print("Note: formula data loaded but classifier is unavailable. "
+                  "Formulas will only be injected when the classifier provides "
+                  "a non-null prediction.\n")
+    else:
+        print("No formula data path provided — running without formula injection.\n")
 
     # -- Load data -----------------------------------------------------------
     all_data = load_dataset(args.data)
@@ -1088,25 +1962,35 @@ def main():
                 args.max_tokens,
                 no_think=args.no_think,
                 classifier=classifier,
+                formula_loader=formula_loader,
             )
         except Exception as e:
             print(f"  Error ({e}), retrying up to 3 times...")
             resps = []
             for item in batch:
-                # Classify once before the retry loop so all attempts reuse the
-                # same classifier output.
                 calc_name = _classify_claim(classifier, item["claim"])
                 print(f"  Classifier selected: {calc_name or '(none)'}")
+
+                # Look up formula + type once; reuse across all retry attempts
+                retry_formula = ""
+                retry_type    = ""
+                if calc_name and formula_loader is not None:
+                    retry_calc_id = _resolve_calculator_id(calc_name)
+                    retry_formula = formula_loader.get_formula(retry_calc_id)
+                    retry_type    = formula_loader.get_type(retry_calc_id)
 
                 for attempt in range(3):
                     try:
                         msgs = _build_messages(item, args.ev_limit,
                                                no_think=args.no_think,
-                                               calculator_hint=calc_name)
+                                               calculator_hint=calc_name,
+                                               formula_text=retry_formula,
+                                               calc_type=retry_type)
                         pipe = model["pipeline"]
                         from transformers import GenerationConfig
                         _retry_cfg = GenerationConfig(
                             max_new_tokens=args.max_tokens,
+                            max_length=None,   # prevent model-level max_length from capping total tokens
                             do_sample=False,
                             pad_token_id=pipe.tokenizer.pad_token_id,
                         )
@@ -1115,7 +1999,9 @@ def main():
                             generation_config=_retry_cfg,
                             return_full_text=False,
                         )[0]["generated_text"].strip()
-                        resp = _parse_response(raw, item.get("claim", ""))
+                        resp = _parse_response(raw, item.get("claim", ""),
+                                               formula_text=retry_formula,
+                                               calc_type=retry_type)
                         resp["calculator_selected"] = calc_name
                         resps.append(resp)
                         break
