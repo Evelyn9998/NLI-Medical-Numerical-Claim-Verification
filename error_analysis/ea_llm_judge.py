@@ -17,7 +17,7 @@ Usage:
     python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv \
         --model deepseek-v4-pro --base-url https://api.deepseek.com
 
-    # Full run, skip held-out validation set (indices: 18,52,95,50,35,53,74,86,9)
+    # Full run, skip held-out validation set (38 indices, see VALIDATION_INDICES)
     python ea_llm_judge.py --data ../results/zs_cot/zs_cot_llama_full.csv \
         --model deepseek-v4-pro --base-url https://api.deepseek.com --skip-validation
 """
@@ -114,7 +114,7 @@ Respond with ONLY valid JSON — no markdown, no preamble:
 
 
 def build_few_shot_block(examples: list, ev_limit: int = 600,
-                          reasoning_limit: int = 500) -> str:
+                          reasoning_limit: int = 3000) -> str:
     lines = ["=== FEW-SHOT EXAMPLES ===\n"]
     for i, ex in enumerate(examples, 1):
         lines.append(f"--- Example {i} (primary type: {ex['primary_type']}) ---")
@@ -130,7 +130,7 @@ def build_few_shot_block(examples: list, ev_limit: int = 600,
 
 
 def build_user_message(row: dict, few_shot_block: str,
-                        ev_limit: int = 1000, reasoning_limit: int = 700) -> str:
+                        ev_limit: int = 1000, reasoning_limit: int = 3000) -> str:
     return (
         few_shot_block
         + f"TRUE LABEL : {row['true_label']}\n"
@@ -240,12 +240,15 @@ def main():
     parser.add_argument("--model",           default="gpt-4o")
     parser.add_argument("--base-url",        default="",
                         help="API base URL (e.g. https://api.deepseek.com for DeepSeek)")
-    parser.add_argument("--samples",          type=int, default=0)
+    parser.add_argument("--samples",          type=int, default=0,
+                        help="Number of samples to process (0 = all)")
     parser.add_argument("--skip-validation",  action="store_true",
                         help="Exclude held-out validation indices from processing")
     parser.add_argument("--validation-only",  action="store_true",
                         help="Run ONLY the 9 held-out validation indices")
     parser.add_argument("--output",           default="")
+    parser.add_argument("--resume",           default="",
+                        help="Path to existing output CSV to resume from (skips already-processed indices)")
     parser.add_argument("--debug",            action="store_true",
                         help="Print raw API response for each sample")
     args = parser.parse_args()
@@ -258,7 +261,7 @@ def main():
         api_key=args.api_key,
         **({"base_url": args.base_url} if args.base_url else {}),
     )
-    is_reasoner = "reasoner" in args.model.lower()
+    is_reasoner = "reasoner" in args.model.lower() or "r1" in args.model.lower()
     if args.base_url and not is_reasoner:
         # Non-reasoner DeepSeek models default to thinking mode, which exhausts
         # max_tokens before producing content. Disable it for direct JSON output.
@@ -271,6 +274,21 @@ def main():
 
     few_shot_indices = {ex["index"] for ex in FEW_SHOT_EXAMPLES}
 
+    # Resume: load already-processed indices from existing output file
+    done_indices = set()
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f"Resume file not found: {args.resume}")
+            sys.exit(1)
+        with open(args.resume, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                try:
+                    done_indices.add(int(float(row["index"])))
+                except Exception:
+                    pass
+        print(f"Resuming: {len(done_indices)} already done, appending to {args.resume}")
+        args.output = args.resume
+
     if args.validation_only:
         all_errors = load_errors(args.data, skip_indices=few_shot_indices)
         subset = [r for r in all_errors if int(float(r["index"])) in VALIDATION_INDICES]
@@ -279,6 +297,8 @@ def main():
         skip = skip | few_shot_indices
         all_errors = load_errors(args.data, skip_indices=skip)
         subset = all_errors if args.samples == 0 else all_errors[:args.samples]
+    if done_indices:
+        subset = [r for r in subset if int(float(r["index"])) not in done_indices]
     n = len(subset)
     print(f"Loaded {n} samples  |  few-shot: {len(FEW_SHOT_EXAMPLES)}")
 
@@ -288,8 +308,9 @@ def main():
     fieldnames = ["index", "true_label", "predicted_label"] + VALID_TYPES + [
         "explanation", "evidence_snippet", "claim", "model_reasoning_snippet"]
 
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+    if not args.resume:
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     print(f"Writing to: {out_path}\n")
 
     results = []
@@ -330,7 +351,7 @@ def main():
                 "explanation":         res["explanation"],
                 "evidence_snippet":    row["evidence"][:200].replace("\n", " "),
                 "claim":               row["claim"],
-                "model_reasoning_snippet": row["model_reasoning"][:200].replace("\n", " "),
+                "model_reasoning_snippet": row["model_reasoning"].replace("\n", " "),
             })
 
         elapsed = time.time() - t_start
