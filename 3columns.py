@@ -347,8 +347,8 @@ def fill_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    INPUT  = r"02_zs_pot_llama.csv"
-    OUTPUT = r"02_zs_pot_llama_full_processed.csv"
+    INPUT  = r"results\3_zs_pot\zs_pot_gpt.csv"
+    OUTPUT = r"results\3_zs_pot\zs_pot_gpt_full_processed.csv"
 
     df     = pd.read_csv(INPUT)
     df_out = fill_columns(df)
