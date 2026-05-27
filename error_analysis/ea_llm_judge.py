@@ -109,7 +109,7 @@ Respond with ONLY valid JSON — no markdown, no preamble:
   "computation_error": <0 or 1>,
   "omitted_calculation_process_or_result": <0 or 1>,
   "other_error": <0 or 1>,
-  "explanation": "<2-4 sentences describing each error type that is present>"
+  "explanation": "<thorough description of each error type that is present, citing specific evidence from the claim, evidence, and model reasoning>"
 }"""
 
 
@@ -162,8 +162,8 @@ def parse_response(raw: str) -> dict:
         for slug in VALID_TYPES:
             if re.search(rf'"{slug}"\s*:\s*1', clean):
                 result[slug] = 1
-        ex = re.search(r'"explanation"\s*:\s*"([\s\S]+?)"(?:\s*[,}])', clean)
-        result["explanation"] = ex.group(1).strip() if ex else raw[:300]
+        ex = re.search(r'"explanation"\s*:\s*"((?:[^"\\]|\\.)*)"', clean)
+        result["explanation"] = ex.group(1).strip() if ex else raw[:500]
         if not any(result[t] for t in VALID_TYPES):
             result["other_error"] = 1
         return result
@@ -266,7 +266,7 @@ def main():
         # Non-reasoner DeepSeek models default to thinking mode, which exhausts
         # max_tokens before producing content. Disable it for direct JSON output.
         extra_body = {"thinking": {"type": "disabled"}}
-        max_tokens = 600
+        max_tokens = 1500
     else:
         extra_body = None
         max_tokens = 4000  # reasoner needs tokens for both thinking and output
@@ -306,7 +306,7 @@ def main():
 
     out_path = args.output or f"error_fewshot_{args.model.replace('/', '-')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     fieldnames = ["index", "true_label", "predicted_label"] + VALID_TYPES + [
-        "explanation", "evidence_snippet", "claim", "model_reasoning_snippet"]
+        "explanation", "evidence", "claim", "model_reasoning"]
 
     if not args.resume:
         with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -349,9 +349,9 @@ def main():
                 "predicted_label":     row["predicted_label"],
                 **{t: res[t] for t in VALID_TYPES},
                 "explanation":         res["explanation"],
-                "evidence_snippet":    row["evidence"][:200].replace("\n", " "),
+                "evidence":            row["evidence"].replace("\n", " "),
                 "claim":               row["claim"],
-                "model_reasoning_snippet": row["model_reasoning"].replace("\n", " "),
+                "model_reasoning":     row["model_reasoning"].replace("\n", " "),
             })
 
         elapsed = time.time() - t_start
